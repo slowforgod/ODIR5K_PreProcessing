@@ -1,0 +1,80 @@
+{
+  "macro_auc": 0.8571735227639918,
+  "per_class_auc": {
+    "N": 0.7486335973092377,
+    "D": 0.77,
+    "G": 0.8936831756175494,
+    "C": 0.916474695418814,
+    "A": 0.8596441387559809,
+    "H": 0.8466773776052127,
+    "M": 0.9651016746411483
+  },
+  "macro_f1": 0.6192748974647363,
+  "kappa": 0.5063209346956106,
+  "sensitivity": {
+    "N": 0.9267139479905437,
+    "D": 0.9058823529411765,
+    "G": 0.569620253164557,
+    "C": 0.7682926829268293,
+    "A": 0.53125,
+    "H": 0.2619047619047619,
+    "M": 0.75
+  },
+  "specificity": {
+    "N": 0.43731778425655976,
+    "D": 0.4415204678362573,
+    "G": 0.9718446601941747,
+    "C": 0.9766309639727361,
+    "A": 0.9885167464114832,
+    "H": 0.9803186504217432,
+    "M": 0.9904306220095693
+  },
+  "timestamp": "2026-05-28T10:55:17.334289Z",
+  "config_snapshot": {
+    "experiment_name": "v0_resnet50_seed42",
+    "model_name": "resnet50",
+    "num_classes": 7,
+    "class_names": [
+      "N",
+      "D",
+      "G",
+      "C",
+      "A",
+      "H",
+      "M"
+    ],
+    "data": {
+      "image_dir": "data/preprocessed_images",
+      "csv_path": "data/full_df.csv",
+      "split_path": "data/patient_split_7class_stratified.json",
+      "split_train_key": "train_patients",
+      "split_val_key": "val_patients",
+      "patient_id_col": "ID",
+      "filename_col": "filename",
+      "class_cols": [
+        "N",
+        "D",
+        "G",
+        "C",
+        "A",
+        "H",
+        "M"
+      ],
+      "img_size": 224
+    },
+    "train": {
+      "batch_size": 32,
+      "num_epochs": 30,
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "dropout": 0.5,
+      "patience": 8,
+      "seed": 42,
+      "device": "cuda",
+      "num_workers": 4,
+      "use_amp": true
+    },
+    "preprocessing": {},
+    "output_dir": "analysis/v0_analysis"
+  }
+}
