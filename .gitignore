@@ -1,0 +1,35 @@
+# data — 이미지 / CSV / split JSON 모두 git에서 제외 (팀 Drive 공유)
+data/preprocessed_images/*
+!data/preprocessed_images/.gitkeep
+data/full_df.csv
+data/patient_split_*.json
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 모델 체크포인트 / 임계값 / 텐서
+*.pth
+*.pt
+*.npy
+
+# 결과 JSON은 git에 커밋 허용 (analysis/v*_analysis/*.json은 명시적 추적)
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# venv
+venv/
+.venv/
+env/
+
+# env files
+.env
+.env.local
