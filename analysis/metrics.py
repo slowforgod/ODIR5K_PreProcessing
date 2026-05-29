@@ -84,8 +84,8 @@ def compute_metrics(
         class_names  : list of C class name strings
 
     Returns:
-        dict with keys: macro_auc, per_class_auc, macro_f1,
-                        kappa, sensitivity, specificity
+        dict with keys: macro_auc, per_class_auc, macro_f1, per_class_f1,
+                        kappa, per_class_kappa, sensitivity, specificity
     """
     num_classes = len(class_names)
 
@@ -107,20 +107,31 @@ def compute_metrics(
         else:
             per_class_auc[cls] = None
 
-    # ---- macro_f1 ----
+    # ---- macro_f1 + per_class_f1 ----
     macro_f1 = float(
         f1_score(y_true, y_pred_binary, average="macro", zero_division=0)
     )
+    per_class_f1_arr = f1_score(
+        y_true, y_pred_binary, average=None, zero_division=0
+    )
+    per_class_f1 = {
+        cls: float(per_class_f1_arr[i]) for i, cls in enumerate(class_names)
+    }
 
     # ---- kappa (per-class quadratic-weighted, averaged over valid classes) ----
+    # per_class_kappa[c] is None if c has only one class present (kappa undefined).
+    per_class_kappa = {}
     kappa_vals = []
-    for i in range(num_classes):
+    for i, cls in enumerate(class_names):
         pos = int(y_true[:, i].sum())
         if 0 < pos < len(y_true):
-            k = cohen_kappa_score(
+            k = float(cohen_kappa_score(
                 y_true[:, i], y_pred_binary[:, i], weights="quadratic"
-            )
+            ))
+            per_class_kappa[cls] = k
             kappa_vals.append(k)
+        else:
+            per_class_kappa[cls] = None
     kappa = float(np.mean(kappa_vals)) if kappa_vals else 0.0
 
     # ---- sensitivity / specificity (per class) ----
@@ -138,7 +149,9 @@ def compute_metrics(
         "macro_auc": macro_auc,
         "per_class_auc": per_class_auc,
         "macro_f1": macro_f1,
+        "per_class_f1": per_class_f1,
         "kappa": kappa,
+        "per_class_kappa": per_class_kappa,
         "sensitivity": sensitivity,
         "specificity": specificity,
     }
@@ -220,8 +233,10 @@ def evaluate_with_tta(
         class_names : list of class name strings; defaults to ["0", "1", ...]
 
     Returns:
-        dict with keys: probs, labels, thresholds, and all 5 metric keys
-                        from compute_metrics().
+        dict with keys: probs, labels, thresholds, and all metric keys
+                        from compute_metrics() (macro_auc, per_class_auc,
+                        macro_f1, per_class_f1, kappa, per_class_kappa,
+                        sensitivity, specificity).
     """
     model.eval()
     all_probs = []

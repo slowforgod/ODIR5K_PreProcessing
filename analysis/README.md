@@ -50,12 +50,14 @@ analysis/
 **반환 dict**:
 ```python
 {
-    "macro_auc":      float,                    # sklearn.roc_auc_score(average='macro')
-    "per_class_auc":  {class_name: float|None}, # 클래스별 AUC
-    "macro_f1":       float,                    # sklearn.f1_score(average='macro', zero_division=0)
-    "kappa":          float,                    # per-class quadratic-weighted Kappa의 macro 평균
-    "sensitivity":    {class_name: float},      # TP / (TP+FN)
-    "specificity":    {class_name: float},      # TN / (TN+FP)
+    "macro_auc":       float,                    # sklearn.roc_auc_score(average='macro')
+    "per_class_auc":   {class_name: float|None}, # 클래스별 AUC
+    "macro_f1":        float,                    # sklearn.f1_score(average='macro', zero_division=0)
+    "per_class_f1":    {class_name: float},      # 클래스별 F1
+    "kappa":           float,                    # per-class quadratic-weighted Kappa의 macro 평균
+    "per_class_kappa": {class_name: float|None}, # 클래스별 Kappa (양/음성 모두 있을 때만)
+    "sensitivity":     {class_name: float},      # TP / (TP+FN)
+    "specificity":     {class_name: float},      # TN / (TN+FP)
 }
 ```
 
@@ -63,8 +65,10 @@ analysis/
 - `macro_auc`: 양성/음성이 한쪽뿐인 클래스가 있어 `ValueError`가 발생하면 → `NaN`으로 처리
 - `per_class_auc`: `0 < y_true[:, i].sum() < len(y_true)` 인 경우에만 계산, 아니면 `None`
 - `macro_f1`: `sklearn.f1_score(..., average='macro', zero_division=0)` 사용
+- `per_class_f1`: `sklearn.f1_score(..., average=None, zero_division=0)` 사용 (클래스별 그대로)
 - `kappa`: 클래스별로 `cohen_kappa_score(y_true[:,i], y_pred_binary[:,i], weights='quadratic')`을 구한 뒤 macro 평균.
   양성/음성이 한쪽뿐인 클래스는 제외하고 평균. 리스트가 비면 `0.0`.
+- `per_class_kappa`: 위와 동일하게 계산한 클래스별 값. 양/음성이 한쪽뿐인 클래스는 `None`.
 - `sensitivity[c]`, `specificity[c]`: threshold 적용 후 이진화한 예측으로 TP/FP/TN/FN 계산
 
 ### `save_metrics(metrics, save_dir, experiment_name)`
