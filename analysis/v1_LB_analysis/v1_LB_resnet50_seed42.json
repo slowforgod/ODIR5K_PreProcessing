@@ -1,0 +1,104 @@
+{
+  "macro_auc": 0.867403340283167,
+  "per_class_auc": {
+    "N": 0.7644032283632803,
+    "D": 0.80171998624011,
+    "G": 0.8741919626397936,
+    "C": 0.9399624765478424,
+    "A": 0.8603767942583731,
+    "H": 0.8619404650332485,
+    "M": 0.9692284688995214
+  },
+  "macro_f1": 0.6474476622380828,
+  "per_class_f1": {
+    "N": 0.655511811023622,
+    "D": 0.6695187165775401,
+    "G": 0.5454545454545454,
+    "C": 0.7906976744186046,
+    "A": 0.6666666666666666,
+    "H": 0.3939393939393939,
+    "M": 0.8103448275862069
+  },
+  "kappa": 0.559846194286154,
+  "per_class_kappa": {
+    "N": 0.3790255748992907,
+    "D": 0.432097312794677,
+    "G": 0.5089936657673985,
+    "C": 0.7731436234288701,
+    "A": 0.6488927399063537,
+    "H": 0.37677372221753913,
+    "M": 0.7999967209889498
+  },
+  "sensitivity": {
+    "N": 0.7872340425531915,
+    "D": 0.7364705882352941,
+    "G": 0.569620253164557,
+    "C": 0.8292682926829268,
+    "A": 0.59375,
+    "H": 0.30952380952380953,
+    "M": 0.734375
+  },
+  "specificity": {
+    "N": 0.6209912536443148,
+    "D": 0.7119883040935673,
+    "G": 0.9601941747572815,
+    "C": 0.9785783836416748,
+    "A": 0.9885167464114832,
+    "H": 0.9896907216494846,
+    "M": 0.9952153110047847
+  },
+  "timestamp": "2026-05-29T12:28:46.248555Z",
+  "config_snapshot": {
+    "experiment_name": "v1_LB_resnet50_seed42",
+    "model_name": "resnet50",
+    "num_classes": 7,
+    "class_names": [
+      "N",
+      "D",
+      "G",
+      "C",
+      "A",
+      "H",
+      "M"
+    ],
+    "data": {
+      "image_dir": "data/preprocessed_images",
+      "csv_path": "data/full_df.csv",
+      "split_path": "data/patient_split_7class_stratified.json",
+      "split_train_key": "train_patients",
+      "split_val_key": "val_patients",
+      "patient_id_col": "ID",
+      "filename_col": "filename",
+      "class_cols": [
+        "N",
+        "D",
+        "G",
+        "C",
+        "A",
+        "H",
+        "M"
+      ],
+      "img_size": 224
+    },
+    "train": {
+      "batch_size": 32,
+      "num_epochs": 30,
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "dropout": 0.5,
+      "patience": 8,
+      "seed": 42,
+      "device": "cuda",
+      "num_workers": 4,
+      "use_amp": true
+    },
+    "preprocessing": {
+      "clip_limit": 2.0,
+      "tile_grid_size": [
+        8,
+        8
+      ]
+    },
+    "output_dir": "analysis/v1_LB_analysis"
+  }
+}
