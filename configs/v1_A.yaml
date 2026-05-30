@@ -1,0 +1,33 @@
+experiment_name: "v1_A_resnet50_seed42"
+model_name: "resnet50"
+num_classes: 7
+class_names: ["N", "D", "G", "C", "A", "H", "M"]
+
+data:
+  image_dir: "data/preprocessed_images"
+  csv_path: "data/full_df.csv"
+  split_path: "data/patient_split_7class_stratified.json"
+  split_train_key: "train_patients"
+  split_val_key: "val_patients"
+  patient_id_col: "ID"
+  filename_col: "filename"
+  class_cols: ["N", "D", "G", "C", "A", "H", "M"]
+  img_size: 224
+
+train:
+  batch_size: 32
+  num_epochs: 30
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  dropout: 0.5
+  patience: 8
+  seed: 42
+  device: "cuda"
+  num_workers: 4
+  use_amp: true
+
+preprocessing:
+  clip_limit: 2.0
+  tile_grid_size: [8, 8]
+
+output_dir: "analysis/v1_A_analysis"
