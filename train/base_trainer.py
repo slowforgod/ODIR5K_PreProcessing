@@ -14,12 +14,92 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 from PIL import Image
 
 from model.base import build_model
 from analysis.metrics import evaluate_with_tta, save_metrics
+
+
+# ---------------------------------------------------------------------------
+# Allowed config values
+# ---------------------------------------------------------------------------
+
+ALLOWED_SELECTION = {"macro_auc", "macro_f1", "macro_kappa"}
+ALLOWED_LOSS = {"weighted_bce", "focal"}
+
+
+# ---------------------------------------------------------------------------
+# Focal Loss (logits)
+# ---------------------------------------------------------------------------
+
+class FocalLossWithLogits(nn.Module):
+    """Multi-label focal loss operating on raw logits.
+
+    Loss per element = (1 - p_t)^gamma * BCEWithLogits(logits, target)
+    where p_t = sigmoid(logits) if target == 1 else 1 - sigmoid(logits).
+
+    Optional pos_weight is multiplied into the underlying BCE term, matching
+    nn.BCEWithLogitsLoss(pos_weight=...) semantics. Useful for boosting
+    minority-class sensitivity (A / H / M classes in ODIR-5K).
+
+    Args:
+        gamma      : focusing parameter (higher → more focus on hard examples)
+        pos_weight : optional (num_classes,) tensor on the same device as logits
+    """
+
+    def __init__(self, gamma: float = 2.0, pos_weight: Optional[torch.Tensor] = None):
+        super().__init__()
+        self.gamma = float(gamma)
+        if pos_weight is not None:
+            # buffer follows .to(device) on the parent nn.Module
+            self.register_buffer("pos_weight", pos_weight)
+        else:
+            self.pos_weight = None
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        bce = F.binary_cross_entropy_with_logits(
+            logits, target,
+            pos_weight=self.pos_weight,
+            reduction="none",
+        )
+        p = torch.sigmoid(logits)
+        p_t = p * target + (1.0 - p) * (1.0 - target)
+        focal_w = (1.0 - p_t) ** self.gamma
+        return (focal_w * bce).mean()
+
+
+def _build_criterion(
+    loss_type: str,
+    pos_weight: torch.Tensor,
+    focal_gamma: float,
+    focal_use_pos_weight: bool,
+    device: torch.device,
+) -> nn.Module:
+    """Build the loss criterion based on config.
+
+    Args:
+        loss_type            : "weighted_bce" | "focal"
+        pos_weight           : (num_classes,) tensor on `device`
+        focal_gamma          : gamma for focal loss
+        focal_use_pos_weight : whether focal loss also uses pos_weight
+        device               : target device for criterion buffers
+
+    Returns:
+        nn.Module ready to call as criterion(logits, target).
+    """
+    loss_type = loss_type.lower().strip()
+    if loss_type not in ALLOWED_LOSS:
+        raise ValueError(
+            f"loss_type must be one of {sorted(ALLOWED_LOSS)}, got '{loss_type}'"
+        )
+    if loss_type == "weighted_bce":
+        return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    # focal
+    pw = pos_weight if focal_use_pos_weight else None
+    return FocalLossWithLogits(gamma=focal_gamma, pos_weight=pw).to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -224,9 +304,15 @@ class BaseTrainer:
             dropout=train_cfg.get("dropout", 0.5),
         ).to(self.device)
 
-        # Loss
+        # Loss — selectable via train.loss_type (default: weighted_bce)
         pos_weight = _build_pos_weight(self.train_df, self.class_cols, self.device)
-        self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        loss_type = str(train_cfg.get("loss_type", "weighted_bce"))
+        focal_gamma = float(train_cfg.get("focal_gamma", 2.0))
+        focal_use_pw = bool(train_cfg.get("focal_use_pos_weight", True))
+        self.criterion = _build_criterion(
+            loss_type, pos_weight, focal_gamma, focal_use_pw, self.device,
+        )
+        self.loss_type = loss_type
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -247,7 +333,34 @@ class BaseTrainer:
         self.experiment_name = cfg["experiment_name"]
         os.makedirs(self.output_dir, exist_ok=True)
 
-        self.best_auc = -1.0
+        # ---- Run tag (optional file suffix) ----
+        # Allows multiple runs in the same output_dir (e.g. weighted_bce vs focal)
+        # to coexist without overwriting best/thresholds/history.
+        # If unset → keeps the original filenames (best.pth …).
+        run_tag = train_cfg.get("run_tag")
+        suffix = f"_{run_tag}" if run_tag else ""
+        self.run_tag = run_tag
+        self._ckpt_filename = f"best{suffix}.pth"
+        self._thr_filename = f"thresholds{suffix}.npy"
+        self._history_filename = f"history{suffix}.csv"
+
+        # ---- Best model selection metric ----
+        # Default "macro_auc" preserves existing behaviour for V0/V2/V4.
+        # V1 overrides via configs/v1.yaml → "macro_f1" or "macro_kappa".
+        selection_metric = str(train_cfg.get("selection_metric", "macro_auc")).lower()
+        if selection_metric not in ALLOWED_SELECTION:
+            raise ValueError(
+                f"selection_metric must be one of {sorted(ALLOWED_SELECTION)}, "
+                f"got '{selection_metric}'"
+            )
+        self.selection_metric = selection_metric
+        # Map to the key returned by analysis.metrics.compute_metrics.
+        # "macro_kappa" is reported as "kappa" inside that dict.
+        self._selection_key = (
+            "kappa" if selection_metric == "macro_kappa" else selection_metric
+        )
+
+        self.best_score = -1.0
         self.patience_counter = 0
         self.best_thresholds: Optional[np.ndarray] = None
 
@@ -297,7 +410,7 @@ class BaseTrainer:
     # ------------------------------------------------------------------
 
     def _append_history(self, epoch: int, train_loss: float, val_result: dict):
-        path = os.path.join(self.output_dir, "history.csv")
+        path = os.path.join(self.output_dir, self._history_filename)
         write_header = not os.path.exists(path)
         with open(path, "a", newline="") as f:
             writer = csv.writer(f)
@@ -322,12 +435,15 @@ class BaseTrainer:
         print(f"[{self.experiment_name}] Training on {self.device}")
         print(f"  Train: {len(self.train_loader.dataset)} samples")
         print(f"  Val  : {len(self.val_loader.dataset)} samples")
-        print(f"  Epochs: {self.num_epochs}  Patience: {self.patience}\n")
+        print(f"  Epochs: {self.num_epochs}  Patience: {self.patience}")
+        print(f"  Loss: {self.loss_type}  |  Selection: val_{self.selection_metric} (maximise)\n")
 
         for epoch in range(1, self.num_epochs + 1):
             train_loss = self._train_epoch()
             val_result = self._val_step()
             val_auc = val_result.get("macro_auc", -1.0)
+            val_f1 = val_result.get("macro_f1", 0.0)
+            val_kappa = val_result.get("kappa", 0.0)
 
             self._append_history(epoch, train_loss, val_result)
             self.scheduler.step()
@@ -336,27 +452,28 @@ class BaseTrainer:
                 f"Epoch {epoch:03d}/{self.num_epochs} | "
                 f"train_loss={train_loss:.4f} | "
                 f"val_auc={val_auc:.4f} | "
-                f"val_f1={val_result.get('macro_f1', 0):.4f} | "
-                f"val_kappa={val_result.get('kappa', 0):.4f}"
+                f"val_f1={val_f1:.4f} | "
+                f"val_kappa={val_kappa:.4f}"
             )
 
-            # Early stopping on Val Macro AUC
-            if val_auc > self.best_auc:
-                self.best_auc = val_auc
+            # Best model tracking — by configured selection_metric (maximise)
+            current = val_result.get(self._selection_key, float("nan"))
+            if not np.isnan(current) and current > self.best_score:
+                self.best_score = current
                 self.best_thresholds = val_result["thresholds"]
                 self.patience_counter = 0
-                ckpt_path = os.path.join(self.output_dir, "best.pth")
+                ckpt_path = os.path.join(self.output_dir, self._ckpt_filename)
                 torch.save(self.model.state_dict(), ckpt_path)
-                thr_path = os.path.join(self.output_dir, "thresholds.npy")
+                thr_path = os.path.join(self.output_dir, self._thr_filename)
                 np.save(thr_path, self.best_thresholds)
-                print(f"  ★ Best saved (AUC={self.best_auc:.4f})")
+                print(f"  ★ Best saved (val_{self.selection_metric}={self.best_score:.4f})")
             else:
                 self.patience_counter += 1
                 if self.patience_counter >= self.patience:
                     print(f"\nEarly stopping at epoch {epoch}.")
                     break
 
-        print(f"\nTraining done. Best Val AUC: {self.best_auc:.4f}")
+        print(f"\nTraining done. Best val_{self.selection_metric}: {self.best_score:.4f}")
 
     # ------------------------------------------------------------------
     # evaluate_and_save
@@ -364,12 +481,12 @@ class BaseTrainer:
 
     def evaluate_and_save(self):
         """Load best checkpoint, evaluate with saved thresholds, save JSON."""
-        ckpt_path = os.path.join(self.output_dir, "best.pth")
+        ckpt_path = os.path.join(self.output_dir, self._ckpt_filename)
         self.model.load_state_dict(
             torch.load(ckpt_path, map_location=self.device)
         )
 
-        thr_path = os.path.join(self.output_dir, "thresholds.npy")
+        thr_path = os.path.join(self.output_dir, self._thr_filename)
         thresholds = np.load(thr_path)
 
         result = evaluate_with_tta(
