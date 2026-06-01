@@ -5,10 +5,18 @@ Entry point for the redesigned V1 experiment: 5 CLAHE variants + per-class routi
 
 Trains one ResNet-50 per variant sequentially, then combines results via
 hard routing and uniform soft routing on the validation set.
+Test set is evaluated with the best thresholds from val (no recomputation).
 
 Usage:
     python -m train.train_v1 --config configs/v1.yaml
     python -m train.train_v1 --config configs/v1.yaml --smoke
+
+변경 이력:
+  - split JSON: patient_split_7class_stratified.json (8:2)
+              → patient_split_7class_stratified_811.json (8:1:1)
+  - test split 로드 + test_loader 구성
+  - 각 variant 학습 후 test 평가 추가 (val threshold 재사용)
+  - 최종 JSON에 per_variant_test_metrics, routing test 결과 포함
 """
 
 import argparse
@@ -74,17 +82,6 @@ def _to_serializable(obj):
 # ---------------------------------------------------------------------------
 
 class ODIRV1Dataset(Dataset):
-    """ODIR-5K dataset for V1 multi-variant CLAHE experiment.
-
-    CLAHE is applied as a numpy op in __getitem__ via preprocessor.apply().
-    The CLAHE object is held by the preprocessor (created once, reused here).
-    PIL is opened and converted to numpy uint8 once; ToTensor accepts HWC
-    uint8 numpy directly, avoiding a redundant Image.fromarray roundtrip.
-
-    Resize is done via T.Resize on the PIL image before numpy conversion to
-    exploit PIL's high-quality BILINEAR resize at img_size target.
-    """
-
     def __init__(
         self,
         df,
@@ -98,7 +95,6 @@ class ODIRV1Dataset(Dataset):
             df = df.head(smoke_n)
 
         self.preprocessor = preprocessor
-
         self._resize = T.Resize((img_size, img_size))
         self._to_tensor_norm = T.Compose([
             T.ToTensor(),
@@ -126,7 +122,6 @@ class ODIRV1Dataset(Dataset):
         img_pil = self._resize(Image.open(img_path).convert("RGB"))
 
         if self.preprocessor is not None:
-            # numpy uint8 HWC — CLAHE operates in-place on LAB channels
             img_np = np.array(img_pil, dtype=np.uint8)
             img_np, _ = self.preprocessor.apply(img_np, label)
             img_tensor = self._to_tensor_norm(img_np)
@@ -141,20 +136,9 @@ class ODIRV1Dataset(Dataset):
 # ---------------------------------------------------------------------------
 
 def _compute_label_stats(dataset: ODIRV1Dataset) -> tuple:
-    """Compute sampler weights and pos_weight from dataset labels in ONE pass.
-
-    Labels are identical across all 5 V1 variants (only images differ), so
-    this is called once and the results cached for all subsequent variants.
-
-    Returns:
-        sample_weights : (N,) float32 cpu tensor for WeightedRandomSampler
-        pos_weight     : (C,) float32 cpu tensor for BCEWithLogitsLoss(pos_weight=...)
-                         (caller moves to device once outside the loop)
-    """
-    labels = np.stack([s[1] for s in dataset.samples])    # (N, C)
-    class_freq = labels.sum(axis=0).clip(min=1.0)          # (C,)
-    class_inv = 1.0 / class_freq                           # (C,)
-
+    labels = np.stack([s[1] for s in dataset.samples])
+    class_freq = labels.sum(axis=0).clip(min=1.0)
+    class_inv = 1.0 / class_freq
     sample_weights = torch.tensor(
         (labels * class_inv).sum(axis=1), dtype=torch.float32
     )
@@ -198,7 +182,7 @@ def _train_one_epoch(model, loader, optimizer, criterion, device, scaler=None):
 
 @torch.no_grad()
 def _validate_tta(model, loader, device):
-    """Horizontal-flip TTA validation. Returns (probs, labels) ndarrays."""
+    """Horizontal-flip TTA. Returns (probs, labels) ndarrays."""
     model.eval()
     all_probs, all_labels = [], []
     for imgs, labels in loader:
@@ -249,7 +233,7 @@ def train(cfg: dict, smoke: bool = False) -> None:
     use_amp = cfg["train"].get("use_amp", False) and device.type == "cuda"
 
     # ------------------------------------------------------------------ #
-    # Data loading + split                                                 #
+    # Data loading + split  ★ test 추가                                   #
     # ------------------------------------------------------------------ #
     data_cfg = cfg["data"]
     df = pd.read_csv(data_cfg["csv_path"])
@@ -259,9 +243,16 @@ def train(cfg: dict, smoke: bool = False) -> None:
 
     train_ids = set(split_json[data_cfg["split_train_key"]])
     val_ids   = set(split_json[data_cfg["split_val_key"]])
+    # ★ test_patients — config에 키가 있을 때만 로드 (하위 호환)
+    test_key  = data_cfg.get("split_test_key")
+    test_ids  = set(split_json[test_key]) if test_key and test_key in split_json else None
 
     train_df = df[df[data_cfg["patient_id_col"]].isin(train_ids)].reset_index(drop=True)
     val_df   = df[df[data_cfg["patient_id_col"]].isin(val_ids)].reset_index(drop=True)
+    test_df  = (
+        df[df[data_cfg["patient_id_col"]].isin(test_ids)].reset_index(drop=True)
+        if test_ids is not None else None
+    )
 
     class_cols  = data_cfg["class_cols"]
     image_dir   = data_cfg["image_dir"]
@@ -271,11 +262,12 @@ def train(cfg: dict, smoke: bool = False) -> None:
 
     smoke_train = 200 if smoke else 0
     smoke_val   = 50  if smoke else 0
+    smoke_test  = 50  if smoke else 0
 
-    pre_cfg = cfg.get("preprocessing", {})
-    variants    = pre_cfg.get("variants", DEFAULT_VARIANTS)
-    clip_limit  = float(pre_cfg.get("clip_limit", 2.0))
-    tile_grid   = tuple(pre_cfg.get("tile_grid_size", [8, 8]))
+    pre_cfg    = cfg.get("preprocessing", {})
+    variants   = pre_cfg.get("variants", DEFAULT_VARIANTS)
+    clip_limit = float(pre_cfg.get("clip_limit", 2.0))
+    tile_grid  = tuple(pre_cfg.get("tile_grid_size", [8, 8]))
 
     train_cfg    = cfg["train"]
     batch_size   = int(train_cfg.get("batch_size", 32))
@@ -291,18 +283,22 @@ def train(cfg: dict, smoke: bool = False) -> None:
     os.makedirs(output_base, exist_ok=True)
 
     routing_cfg = cfg.get("routing", {}).get("hard", DEFAULT_HARD_ROUTING)
-
-    # log_thresholds used only for per-epoch metric snapshot (not final)
     log_thresholds = np.full(num_classes, 0.5, dtype=np.float32)
 
-    per_variant_metrics: Dict[str, dict] = {}
-    probs_by_variant:    Dict[str, np.ndarray] = {}
-    val_labels_shared:   Optional[np.ndarray] = None
+    per_variant_metrics:      Dict[str, dict] = {}
+    per_variant_test_metrics: Dict[str, dict] = {}   # ★ test
+    probs_by_variant:         Dict[str, np.ndarray] = {}
+    test_probs_by_variant:    Dict[str, np.ndarray] = {}  # ★ test
+    val_labels_shared:        Optional[np.ndarray] = None
+    test_labels_shared:       Optional[np.ndarray] = None  # ★ test
 
-    # Label-derived stats are identical across all 5 variants (only images differ).
-    # Compute once on first variant's dataset, then reuse for all subsequent variants.
     cached_sampler_weights: Optional[torch.Tensor] = None
     cached_pos_weight_dev:  Optional[torch.Tensor] = None
+
+    print(f"  Train : {len(train_df)} samples")
+    print(f"  Val   : {len(val_df)} samples")
+    if test_df is not None:
+        print(f"  Test  : {len(test_df)} samples")
 
     # ------------------------------------------------------------------ #
     # 5-variant training loop                                              #
@@ -315,15 +311,12 @@ def train(cfg: dict, smoke: bool = False) -> None:
         variant_dir = os.path.join(output_base, variant)
         os.makedirs(variant_dir, exist_ok=True)
 
-        # ---- Preprocessor ----
         preprocessor = V1Preprocessor(
             variant=variant,
             clip_limit=clip_limit,
             tile_grid_size=tile_grid,
         )
 
-        # ---- Datasets ----
-        # is_train_only() is False for all V1 variants → CLAHE on val too
         train_ds = ODIRV1Dataset(
             train_df, image_dir, class_cols,
             img_size=img_size, preprocessor=preprocessor, smoke_n=smoke_train,
@@ -332,36 +325,42 @@ def train(cfg: dict, smoke: bool = False) -> None:
             val_df, image_dir, class_cols,
             img_size=img_size, preprocessor=preprocessor, smoke_n=smoke_val,
         )
+        # ★ test_ds
+        test_ds = (
+            ODIRV1Dataset(
+                test_df, image_dir, class_cols,
+                img_size=img_size, preprocessor=preprocessor, smoke_n=smoke_test,
+            ) if test_df is not None else None
+        )
 
-        print(f"  Train: {len(train_ds)}  Val: {len(val_ds)}")
+        print(f"  Train: {len(train_ds)}  Val: {len(val_ds)}"
+              + (f"  Test: {len(test_ds)}" if test_ds else ""))
 
-        # ---- Label-derived stats: compute once, reuse for all 5 variants ----
         if cached_sampler_weights is None:
             cached_sampler_weights, pos_weight_cpu = _compute_label_stats(train_ds)
             cached_pos_weight_dev = pos_weight_cpu.to(device)
 
-        # ---- DataLoaders ----
         sampler = WeightedRandomSampler(
             cached_sampler_weights,
             num_samples=len(cached_sampler_weights),
             replacement=True,
         )
         train_loader = DataLoader(
-            train_ds,
-            batch_size=batch_size,
-            sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=(device.type == "cuda"),
+            train_ds, batch_size=batch_size, sampler=sampler,
+            num_workers=num_workers, pin_memory=(device.type == "cuda"),
         )
         val_loader = DataLoader(
-            val_ds,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=(device.type == "cuda"),
+            val_ds, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=(device.type == "cuda"),
+        )
+        # ★ test_loader
+        test_loader = (
+            DataLoader(
+                test_ds, batch_size=batch_size, shuffle=False,
+                num_workers=num_workers, pin_memory=(device.type == "cuda"),
+            ) if test_ds is not None else None
         )
 
-        # ---- Fresh model with re-seeded init ----
         seed_everything(seed)
         model = build_model(
             name=cfg["model_name"],
@@ -370,20 +369,16 @@ def train(cfg: dict, smoke: bool = False) -> None:
             dropout=dropout,
         ).to(device)
 
-        # ---- Loss / optimizer / scheduler / scaler ----
         criterion = nn.BCEWithLogitsLoss(pos_weight=cached_pos_weight_dev)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+        scaler    = torch.amp.GradScaler("cuda") if use_amp else None
 
-        optimizer  = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-        scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-        scaler     = torch.amp.GradScaler("cuda") if use_amp else None
-
-        # ---- History CSV ----
         history_path   = os.path.join(variant_dir, "history.csv")
         history_fields = ["epoch", "train_loss", "val_loss", "val_macro_auc", "val_macro_f1", "val_kappa"]
         with open(history_path, "w", newline="") as hf:
             csv.DictWriter(hf, fieldnames=history_fields).writeheader()
 
-        # ---- Training loop ----
         best_auc   = -1.0
         no_improve = 0
         best_epoch = 0
@@ -435,20 +430,20 @@ def train(cfg: dict, smoke: bool = False) -> None:
                     print(f"  [early stop] no improvement for {patience} epochs")
                     break
 
-        # ---- Post-training: reload best.pth, TTA eval, thresholds ----
+        # ---- Post-training: reload best.pth, val TTA eval ----
         if best_auc >= 0 and os.path.isfile(ckpt_path):
-            print(f"\n  [reload] Loading best.pth (epoch {best_epoch}) and re-running TTA...")
+            print(f"\n  [reload] Loading best.pth (epoch {best_epoch}) ...")
             model.load_state_dict(torch.load(ckpt_path, map_location=device))
 
+            # val 평가 + threshold 최적화
             eval_result = evaluate_with_tta(
                 model, val_loader, device, num_classes,
-                thresholds=None,
+                thresholds=None,          # val에서 threshold 최적화
                 class_names=class_names,
             )
             thresholds = eval_result["thresholds"]
             np.save(os.path.join(variant_dir, "thresholds.npy"), thresholds)
 
-            # Store probs for routing aggregation (all variants share identical val_labels)
             probs_by_variant[variant] = eval_result["probs"]
             if val_labels_shared is None:
                 val_labels_shared = eval_result["labels"]
@@ -464,10 +459,35 @@ def train(cfg: dict, smoke: bool = False) -> None:
                 "best_epoch":    best_epoch,
             }
             print(
-                f"  macro_auc={eval_result['macro_auc']:.4f}  "
-                f"macro_f1={eval_result['macro_f1']:.4f}  "
+                f"  [val]  auc={eval_result['macro_auc']:.4f}  "
+                f"f1={eval_result['macro_f1']:.4f}  "
                 f"kappa={eval_result['kappa']:.4f}"
             )
+
+            # ★ test 평가 — val threshold 재사용 (재계산 금지)
+            if test_loader is not None:
+                test_result = evaluate_with_tta(
+                    model, test_loader, device, num_classes,
+                    thresholds=thresholds,   # val threshold 재사용
+                    class_names=class_names,
+                )
+                test_probs_by_variant[variant] = test_result["probs"]
+                if test_labels_shared is None:
+                    test_labels_shared = test_result["labels"]
+
+                per_variant_test_metrics[variant] = {
+                    "macro_auc":     test_result["macro_auc"],
+                    "per_class_auc": test_result["per_class_auc"],
+                    "macro_f1":      test_result["macro_f1"],
+                    "kappa":         test_result["kappa"],
+                    "sensitivity":   test_result["sensitivity"],
+                    "specificity":   test_result["specificity"],
+                }
+                print(
+                    f"  [test] auc={test_result['macro_auc']:.4f}  "
+                    f"f1={test_result['macro_f1']:.4f}  "
+                    f"kappa={test_result['kappa']:.4f}"
+                )
         else:
             print(f"  [warn] No improvement recorded for variant {variant}.")
             probs_by_variant[variant] = np.zeros(
@@ -479,24 +499,29 @@ def train(cfg: dict, smoke: bool = False) -> None:
                 "sensitivity": {}, "specificity": {},
                 "thresholds": [], "best_epoch": 0,
             }
+            if test_loader is not None:
+                test_probs_by_variant[variant] = np.zeros(
+                    (len(test_ds), num_classes), dtype=np.float32
+                )
+                per_variant_test_metrics[variant] = {
+                    "macro_auc": None, "per_class_auc": {},
+                    "macro_f1": None, "kappa": None,
+                    "sensitivity": {}, "specificity": {},
+                }
 
-        # ---- Memory hygiene: free model before next variant ----
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------ #
-    # Routing aggregation                                                  #
+    # Routing aggregation — val                                            #
     # ------------------------------------------------------------------ #
     print(f"\n{'='*60}")
     print("Computing routing metrics...")
-
-    # val_labels_shared is identical for all variants (same val_df, same label columns)
     assert val_labels_shared is not None, "No variant produced a valid eval result."
 
     routing_metrics: Dict[str, dict] = {}
 
-    # Hard routing
     prob_hard = hard_route(probs_by_variant, class_names, routing_cfg)
     thr_hard  = find_optimal_thresholds(prob_hard, val_labels_shared, num_classes)
     met_hard  = compute_metrics(val_labels_shared, prob_hard, thr_hard, class_names)
@@ -511,7 +536,6 @@ def train(cfg: dict, smoke: bool = False) -> None:
         "thresholds":    thr_hard.tolist(),
     }
 
-    # Soft routing (uniform)
     prob_soft = soft_route_uniform(probs_by_variant, class_names)
     thr_soft  = find_optimal_thresholds(prob_soft, val_labels_shared, num_classes)
     met_soft  = compute_metrics(val_labels_shared, prob_soft, thr_soft, class_names)
@@ -526,18 +550,57 @@ def train(cfg: dict, smoke: bool = False) -> None:
         "thresholds":    thr_soft.tolist(),
     }
 
-    print(f"  Hard routing   → macro_auc={met_hard['macro_auc']:.4f}  macro_f1={met_hard['macro_f1']:.4f}")
-    print(f"  Soft (uniform) → macro_auc={met_soft['macro_auc']:.4f}  macro_f1={met_soft['macro_f1']:.4f}")
+    print(f"  [val] Hard routing   → auc={met_hard['macro_auc']:.4f}  f1={met_hard['macro_f1']:.4f}")
+    print(f"  [val] Soft (uniform) → auc={met_soft['macro_auc']:.4f}  f1={met_soft['macro_f1']:.4f}")
+
+    # ★ Routing aggregation — test
+    test_routing_metrics: Dict[str, dict] = {}
+    if test_labels_shared is not None:
+        # hard routing test: val threshold 재사용
+        prob_hard_test = hard_route(test_probs_by_variant, class_names, routing_cfg)
+        met_hard_test  = compute_metrics(test_labels_shared, prob_hard_test, thr_hard, class_names)
+        test_routing_metrics["hard"] = {
+            "routing_map":   routing_cfg,
+            "macro_auc":     met_hard_test["macro_auc"],
+            "per_class_auc": met_hard_test["per_class_auc"],
+            "macro_f1":      met_hard_test["macro_f1"],
+            "kappa":         met_hard_test["kappa"],
+            "sensitivity":   met_hard_test["sensitivity"],
+            "specificity":   met_hard_test["specificity"],
+        }
+
+        # soft routing test: val threshold 재사용
+        prob_soft_test = soft_route_uniform(test_probs_by_variant, class_names)
+        met_soft_test  = compute_metrics(test_labels_shared, prob_soft_test, thr_soft, class_names)
+        test_routing_metrics["soft_uniform"] = {
+            "weighting":     "uniform across all 5 variants",
+            "macro_auc":     met_soft_test["macro_auc"],
+            "per_class_auc": met_soft_test["per_class_auc"],
+            "macro_f1":      met_soft_test["macro_f1"],
+            "kappa":         met_soft_test["kappa"],
+            "sensitivity":   met_soft_test["sensitivity"],
+            "specificity":   met_soft_test["specificity"],
+        }
+
+        print(f"  [test] Hard routing   → auc={met_hard_test['macro_auc']:.4f}  f1={met_hard_test['macro_f1']:.4f}")
+        print(f"  [test] Soft (uniform) → auc={met_soft_test['macro_auc']:.4f}  f1={met_soft_test['macro_f1']:.4f}")
 
     # ------------------------------------------------------------------ #
     # Save combined JSON                                                   #
     # ------------------------------------------------------------------ #
     combined = {
-        "experiment_name":    exp_name,
-        "timestamp":          datetime.utcnow().isoformat() + "Z",
-        "config_snapshot":    cfg,
-        "per_variant_metrics": _to_serializable(per_variant_metrics),
-        "routing_metrics":     _to_serializable(routing_metrics),
+        "experiment_name":         exp_name,
+        "timestamp":               datetime.utcnow().isoformat() + "Z",
+        "config_snapshot":         cfg,
+        "split":                   "8:1:1",
+        "val": {
+            "per_variant_metrics": _to_serializable(per_variant_metrics),
+            "routing_metrics":     _to_serializable(routing_metrics),
+        },
+        "test": {
+            "per_variant_metrics": _to_serializable(per_variant_test_metrics),
+            "routing_metrics":     _to_serializable(test_routing_metrics),
+        } if test_labels_shared is not None else None,
     }
 
     json_path = os.path.join(output_base, f"{exp_name}.json")
