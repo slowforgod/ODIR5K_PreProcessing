@@ -6,9 +6,10 @@ class_names: ["N", "D", "G", "C", "A", "H", "M"]
 data:
   image_dir: "data/preprocessed_images"
   csv_path: "data/full_df.csv"
-  split_path: "data/patient_split_7class_stratified.json"
+  split_path: "data/patient_split_7class_stratified_811.json"   # 변경: 8:1:1
   split_train_key: "train_patients"
   split_val_key: "val_patients"
+  split_test_key: "test_patients"                                # 추가
   patient_id_col: "ID"
   filename_col: "filename"
   class_cols: ["N", "D", "G", "C", "A", "H", "M"]
@@ -34,7 +35,6 @@ preprocessing:
   lse_max_aug_per_source: 12
 
   # Augmentation strengths
-  # img_size는 data.img_size를 단일 진실 소스로 사용 — 여기에 두지 않음
   hflip_p: 0.5
   vflip_p: 0.1
   geo_p: 0.8
@@ -52,7 +52,7 @@ preprocessing:
   blur_limit: [3, 5]
 
 losses:
-  experiments: ["bce_with_logits_loss", "focal_loss", "robust_asymmetric_loss", "cb_bce_with_logits_loss", "cb_focal_loss"]
+  experiments: ["robust_asymmetric_loss", "cb_bce_with_logits_loss", "cb_focal_loss"]
   focal_alpha: 0.75
   focal_gamma: 2.0
   ral_gamma_neg: 2.0
