@@ -2,10 +2,10 @@
 train/train_v1.py
 
 V1 앙상블 추론 전용 스크립트.
-v1_L / v1_LA / v1_LB / v1_LAB 4개 variant의 best.pth를 로드하여
-soft routing (uniform average) 앙상블 후 결과 JSON 저장.
+V0 / V1_L / V1_LA / V1_LB / V1_LAB 5개 variant의 best.pth를 로드하여
+soft routing (uniform average) + hard routing 앙상블 후 결과 JSON 저장.
 
-훈련은 각각 train_v1_L / train_v1_LA / train_v1_LB / train_v1_LAB 로 진행.
+훈련은 각각 train_v0 / train_v1_L / train_v1_LA / train_v1_LB / train_v1_LAB 로 진행.
 
 Usage:
     python -m train.train_v1 --config configs/v1.yaml
@@ -32,6 +32,15 @@ CLASS_NAMES = ["N", "D", "G", "C", "A", "H", "M"]
 _IMAGENET_MEAN = [0.485, 0.456, 0.406]
 _IMAGENET_STD  = [0.229, 0.224, 0.225]
 
+# variant별 preprocessor 매핑
+VARIANT_PREPROCESSOR = {
+    "V0":     ("preprocessing.v0.preprocess",   "V0Preprocessor",  {}),
+    "V1_L":   ("preprocessing.v1.clahe_L",      "V1LPreprocessor", {}),
+    "V1_LA":  ("preprocessing.v1.clahe_LA",     "V1LAPreprocessor", {}),
+    "V1_LB":  ("preprocessing.v1.clahe_LB",     "V1LBPreprocessor", {}),
+    "V1_LAB": ("preprocessing.v1.clahe_LAB",    "V1LABPreprocessor", {}),
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -54,6 +63,18 @@ def _to_serializable(obj):
     if isinstance(obj, (list, tuple)):
         return [_to_serializable(v) for v in obj]
     return obj
+
+
+def _build_preprocessor(variant: str, clip_limit: float, tile_grid: tuple):
+    """variant 이름에 맞는 preprocessor 인스턴스 반환."""
+    import importlib
+    module_path, cls_name, _ = VARIANT_PREPROCESSOR[variant]
+    module = importlib.import_module(module_path)
+    cls = getattr(module, cls_name)
+    # V0는 kwargs 없음, V1_*는 clip_limit / tile_grid_size
+    if variant == "V0":
+        return cls()
+    return cls(clip_limit=clip_limit, tile_grid_size=tile_grid)
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +133,6 @@ class ODIRV1Dataset(Dataset):
 
 @torch.no_grad()
 def _infer_tta(model, loader, device):
-    """Horizontal-flip TTA. Returns (probs, labels) ndarrays."""
     model.eval()
     all_probs, all_labels = [], []
     for imgs, labels in loader:
@@ -134,9 +154,8 @@ def _infer_tta(model, loader, device):
 def run(cfg: dict) -> None:
     import pandas as pd
     from model.base import build_model
-    from preprocessing.v1.clahe import V1Preprocessor
-    from preprocessing.v1.routing import soft_route_uniform
-    from analysis.metrics import compute_metrics, find_optimal_thresholds, save_metrics
+    from preprocessing.v1.routing import hard_route, soft_route_uniform
+    from analysis.metrics import compute_metrics, find_optimal_thresholds
 
     # ── device ──────────────────────────────────────────────────────────
     requested = cfg["train"].get("device", "cpu")
@@ -169,23 +188,16 @@ def run(cfg: dict) -> None:
     num_workers = int(cfg["train"].get("num_workers", 4))
     dropout     = float(cfg["train"].get("dropout", 0.5))
 
-    print(f"Val  : {len(val_df)} samples")
-    if test_df is not None:
-        print(f"Test : {len(test_df)} samples")
-
-    # ── variant 설정 ─────────────────────────────────────────────────────
-    # 각 variant의 best.pth 경로와 preprocessor 매핑
     pre_cfg    = cfg.get("preprocessing", {})
     clip_limit = float(pre_cfg.get("clip_limit", 2.0))
     tile_grid  = tuple(pre_cfg.get("tile_grid_size", [8, 8]))
 
+    routing_hard = cfg.get("routing", {}).get("hard", {})
     variant_cfgs = cfg.get("variants", {})
-    # variant_cfgs 예시:
-    # variants:
-    #   V1_L:   analysis/v1_L_analysis
-    #   V1_LA:  analysis/v1_LA_analysis
-    #   V1_LB:  analysis/v1_LB_analysis
-    #   V1_LAB: analysis/v1_LAB_analysis
+
+    print(f"Val  : {len(val_df)} samples")
+    if test_df is not None:
+        print(f"Test : {len(test_df)} samples")
 
     probs_val_by_variant:  Dict[str, np.ndarray] = {}
     probs_test_by_variant: Dict[str, np.ndarray] = {}
@@ -194,6 +206,7 @@ def run(cfg: dict) -> None:
     per_variant_val:       Dict[str, dict] = {}
     per_variant_test:      Dict[str, dict] = {}
 
+    # ── 각 variant 추론 ──────────────────────────────────────────────────
     for variant, variant_dir in variant_cfgs.items():
         print(f"\n{'='*60}")
         print(f"[{variant}] Loading from {variant_dir}")
@@ -208,7 +221,6 @@ def run(cfg: dict) -> None:
             print(f"  [skip] thresholds.npy not found: {thr_path}")
             continue
 
-        # 모델 로드
         model = build_model(
             name=cfg["model_name"],
             num_classes=num_classes,
@@ -218,12 +230,7 @@ def run(cfg: dict) -> None:
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
         thresholds = np.load(thr_path)
 
-        # preprocessor
-        preprocessor = V1Preprocessor(
-            variant=variant,
-            clip_limit=clip_limit,
-            tile_grid_size=tile_grid,
-        )
+        preprocessor = _build_preprocessor(variant, clip_limit, tile_grid)
 
         # val 추론
         val_ds = ODIRV1Dataset(val_df, image_dir, class_cols, img_size, preprocessor)
@@ -256,23 +263,37 @@ def run(cfg: dict) -> None:
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    # ── soft routing 앙상블 ──────────────────────────────────────────────
-    print(f"\n{'='*60}")
-    print("Soft routing (uniform average) 앙상블...")
     assert val_labels_shared is not None, "No variant produced a valid result."
 
-    # val soft routing
+    # ── soft routing 앙상블 ──────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print("Soft routing (uniform average)...")
+
     prob_soft_val = soft_route_uniform(probs_val_by_variant, class_names)
     thr_soft      = find_optimal_thresholds(prob_soft_val, val_labels_shared, num_classes)
     met_soft_val  = compute_metrics(val_labels_shared, prob_soft_val, thr_soft, class_names)
     print(f"  [val]  auc={met_soft_val['macro_auc']:.4f}  f1={met_soft_val['macro_f1']:.4f}  kappa={met_soft_val['kappa']:.4f}")
 
-    # test soft routing — val threshold 재사용
     met_soft_test = None
     if test_labels_shared is not None:
         prob_soft_test = soft_route_uniform(probs_test_by_variant, class_names)
         met_soft_test  = compute_metrics(test_labels_shared, prob_soft_test, thr_soft, class_names)
         print(f"  [test] auc={met_soft_test['macro_auc']:.4f}  f1={met_soft_test['macro_f1']:.4f}  kappa={met_soft_test['kappa']:.4f}")
+
+    # ── hard routing 앙상블 ──────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print("Hard routing...")
+
+    prob_hard_val = hard_route(probs_val_by_variant, class_names, routing_hard)
+    thr_hard      = find_optimal_thresholds(prob_hard_val, val_labels_shared, num_classes)
+    met_hard_val  = compute_metrics(val_labels_shared, prob_hard_val, thr_hard, class_names)
+    print(f"  [val]  auc={met_hard_val['macro_auc']:.4f}  f1={met_hard_val['macro_f1']:.4f}  kappa={met_hard_val['kappa']:.4f}")
+
+    met_hard_test = None
+    if test_labels_shared is not None:
+        prob_hard_test = hard_route(probs_test_by_variant, class_names, routing_hard)
+        met_hard_test  = compute_metrics(test_labels_shared, prob_hard_test, thr_hard, class_names)
+        print(f"  [test] auc={met_hard_test['macro_auc']:.4f}  f1={met_hard_test['macro_f1']:.4f}  kappa={met_hard_test['kappa']:.4f}")
 
     # ── 결과 저장 ────────────────────────────────────────────────────────
     output_base = cfg.get("output_dir", "analysis/v1_analysis")
@@ -286,11 +307,13 @@ def run(cfg: dict) -> None:
         "split":           "8:1:1",
         "val": {
             "per_variant_metrics": _to_serializable(per_variant_val),
-            "soft_routing":        _to_serializable({**met_soft_val, "thresholds": thr_soft.tolist()}),
+            "soft_routing": _to_serializable({**met_soft_val, "thresholds": thr_soft.tolist()}),
+            "hard_routing": _to_serializable({**met_hard_val, "routing_map": routing_hard, "thresholds": thr_hard.tolist()}),
         },
         "test": {
             "per_variant_metrics": _to_serializable(per_variant_test),
-            "soft_routing":        _to_serializable(met_soft_test),
+            "soft_routing": _to_serializable(met_soft_test),
+            "hard_routing": _to_serializable({**met_hard_test, "routing_map": routing_hard} if met_hard_test else None),
         } if test_labels_shared is not None else None,
     }
 
@@ -307,7 +330,7 @@ def run(cfg: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="V1 soft routing ensemble inference")
+    parser = argparse.ArgumentParser(description="V1 ensemble inference (soft + hard routing)")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
     args = parser.parse_args()
     run(load_config(args.config))

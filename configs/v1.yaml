@@ -27,9 +27,21 @@ preprocessing:
 
 # 각 variant의 best.pth / thresholds.npy 경로
 variants:
+  V0:     "analysis/v0_analysis"
   V1_L:   "analysis/v1_L_analysis"
   V1_LA:  "analysis/v1_LA_analysis"
   V1_LB:  "analysis/v1_LB_analysis"
   V1_LAB: "analysis/v1_LAB_analysis"
+
+# val AUC 기준 클래스별 best variant
+routing:
+  hard:
+    N: "V1_LAB"
+    D: "V1_L"
+    G: "V1_L"
+    C: "V1_LB"
+    A: "V1_L"
+    H: "V1_LB"
+    M: "V0"
 
 output_dir: "analysis/v1_analysis"
