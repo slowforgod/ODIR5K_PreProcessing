@@ -286,12 +286,14 @@ def train(cfg: dict, smoke: bool = False) -> None:
     labels_ref_np = train_df[class_cols].values.astype(np.float32)
     cb_beta       = float(cfg.get("losses", {}).get("cb_beta", 0.9999))
     cb_normalize  = cfg.get("losses", {}).get("cb_weight_normalize", "mean_one")
+    cb_mode       = cfg.get("losses", {}).get("cb_weight_mode", "effective_number")
     cb_weights    = effective_number_class_weights(
-        labels_ref_np, beta=cb_beta, normalize=cb_normalize
+        labels_ref_np, beta=cb_beta, normalize=cb_normalize, mode=cb_mode,
     )
-    print(f"[CB weights from original train_df ({len(train_df)} rows)]")
+    pos_counts_dbg = labels_ref_np.sum(axis=0).astype(int)
+    print(f"[CB weights from original train_df ({len(train_df)} rows), mode={cb_mode}]")
     for i, c in enumerate(class_cols):
-        print(f"  {c}: {cb_weights[i]:.4f}")
+        print(f"  {c}: n={pos_counts_dbg[i]:5d}  w={cb_weights[i]:.4f}")
 
     # ------------------------------------------------------------------ #
     # LSE expansion — done ONCE (records reused for all 25 runs)         #
@@ -499,16 +501,20 @@ def train(cfg: dict, smoke: bool = False) -> None:
                 val_auc   = epoch_metrics["macro_auc"]
                 val_f1    = epoch_metrics["macro_f1"]
                 val_kappa = epoch_metrics["kappa"]
-                val_sens  = float(np.mean(list(epoch_metrics["sensitivity"].values())))
-                val_spec  = float(np.mean(list(epoch_metrics["specificity"].values())))
+                sens_per_class = epoch_metrics["sensitivity"]
+                val_sens  = float(np.mean(list(sens_per_class.values())))
 
                 scheduler.step()
 
+                sens_str = " ".join(
+                    f"{c}={sens_per_class.get(c, float('nan')):.3f}"
+                    for c in class_names
+                )
                 print(
                     f"    Epoch {epoch:03d}/{num_epochs} | "
                     f"loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
-                    f"val_auc={val_auc:.4f} | val_f1={val_f1:.4f} | val_kappa={val_kappa:.4f} | "
-                    f"val_sens={val_sens:.4f} | val_spec={val_spec:.4f}"
+                    f"val_f1={val_f1:.4f} | val_sens_macro={val_sens:.4f} | "
+                    f"sens[{sens_str}]"
                 )
 
                 with open(history_path, "a", newline="") as hf:

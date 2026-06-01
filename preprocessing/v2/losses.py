@@ -36,23 +36,35 @@ def effective_number_class_weights(
     labels_np: np.ndarray,
     beta: float = 0.9999,
     normalize: str = "mean_one",
+    mode: str = "effective_number",
 ) -> torch.Tensor:
-    """Compute class-balanced weights using the effective number formula.
+    """Compute class-balanced weights from per-class positive counts.
 
-    Formula (Cui et al. 2019):
-        w[i] = (1 - beta) / (1 - beta ** n[i])
-    where n[i] is the positive count of class i.
+    Modes:
+        "effective_number" (Cui et al. 2019):
+            w[i] = (1 - beta) / (1 - beta ** n[i])
+        "inverse_frequency":
+            w[i] = 1 / n[i]      # purely proportional to count ratio
 
     Args:
         labels_np : (N, C) multi-hot float32 array — from ORIGINAL train_df
-        beta      : smoothing factor (default 0.9999)
+        beta      : smoothing factor for effective-number mode (default 0.9999)
         normalize : "mean_one" → scale so w.mean() == 1
+        mode      : "effective_number" or "inverse_frequency"
 
     Returns:
         (C,) float32 torch.Tensor
     """
     pos_counts = labels_np.sum(axis=0).clip(min=1)    # (C,)
-    weights = (1.0 - beta) / (1.0 - beta ** pos_counts)
+
+    if mode == "inverse_frequency":
+        weights = 1.0 / pos_counts
+    elif mode == "effective_number":
+        weights = (1.0 - beta) / (1.0 - beta ** pos_counts)
+    else:
+        raise ValueError(
+            f"Unknown mode '{mode}'. Use 'effective_number' or 'inverse_frequency'."
+        )
 
     if normalize == "mean_one":
         weights = weights / weights.mean()
