@@ -1,0 +1,109 @@
+{
+  "macro_auc": 0.8486201558036875,
+  "per_class_auc": {
+    "N": 0.7492711370262389,
+    "D": 0.783859649122807,
+    "G": 0.8827700626766621,
+    "C": 0.9412211746265466,
+    "A": 0.8522727272727273,
+    "H": 0.7765653590395859,
+    "M": 0.954380980861244
+  },
+  "macro_f1": 0.6173534961997846,
+  "per_class_f1": {
+    "N": 0.6608527131782945,
+    "D": 0.6464088397790055,
+    "G": 0.5443786982248521,
+    "C": 0.7560975609756098,
+    "A": 0.6391752577319587,
+    "H": 0.25,
+    "M": 0.8245614035087719
+  },
+  "kappa": 0.5209218169736547,
+  "per_class_kappa": {
+    "N": 0.3831780750515673,
+    "D": 0.3372138628284702,
+    "G": 0.5069716687547994,
+    "C": 0.7366233642862232,
+    "A": 0.6244279093169744,
+    "H": 0.24283113336367768,
+    "M": 0.8152067052138703
+  },
+  "sensitivity": {
+    "N": 0.806146572104019,
+    "D": 0.8258823529411765,
+    "G": 0.5822784810126582,
+    "C": 0.7560975609756098,
+    "A": 0.484375,
+    "H": 0.14285714285714285,
+    "M": 0.734375
+  },
+  "specificity": {
+    "N": 0.60932944606414,
+    "D": 0.5467836257309941,
+    "G": 0.9572815533980582,
+    "C": 0.9805258033106135,
+    "A": 0.9980861244019139,
+    "H": 1.0,
+    "M": 0.9971291866028709
+  },
+  "timestamp": "2026-05-29T05:21:39.398617Z",
+  "config_snapshot": {
+    "experiment_name": "v1_resnet50_clahe_seed42",
+    "model_name": "resnet50",
+    "num_classes": 7,
+    "class_names": [
+      "N",
+      "D",
+      "G",
+      "C",
+      "A",
+      "H",
+      "M"
+    ],
+    "data": {
+      "image_dir": "data/preprocessed_images",
+      "csv_path": "data/full_df.csv",
+      "split_path": "data/patient_split_7class_stratified.json",
+      "split_train_key": "train_patients",
+      "split_val_key": "val_patients",
+      "patient_id_col": "ID",
+      "filename_col": "filename",
+      "class_cols": [
+        "N",
+        "D",
+        "G",
+        "C",
+        "A",
+        "H",
+        "M"
+      ],
+      "img_size": 224
+    },
+    "train": {
+      "batch_size": 32,
+      "num_epochs": 20,
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "dropout": 0.5,
+      "patience": 8,
+      "seed": 42,
+      "device": "cuda",
+      "num_workers": 4,
+      "use_amp": true,
+      "selection_metric": "macro_f1",
+      "loss_type": "weighted_bce",
+      "focal_gamma": 2.0,
+      "focal_use_pos_weight": true,
+      "run_tag": "weighted_bce"
+    },
+    "preprocessing": {
+      "clahe_clip_limit": 2.0,
+      "clahe_tile_grid_size": [
+        8,
+        8
+      ]
+    },
+    "output_dir": "analysis/v1_analysis"
+  }
+}

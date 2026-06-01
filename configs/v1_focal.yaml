@@ -1,4 +1,4 @@
-experiment_name: "v1_resnet50_seed42"
+experiment_name: "v1_resnet50_focal_seed42"
 model_name: "resnet50"
 num_classes: 7
 class_names: ["N", "D", "G", "C", "A", "H", "M"]
@@ -16,7 +16,7 @@ data:
 
 train:
   batch_size: 32
-  num_epochs: 20
+  num_epochs: 30
   lr: 1.0e-4
   weight_decay: 1.0e-4
   dropout: 0.5
@@ -26,19 +26,23 @@ train:
   num_workers: 4
   use_amp: true
 
+  # === Best model selection (weighted_bce 버전과 동일) ===
+  selection_metric: "macro_f1"
+
+  # === Loss function ===
+  # Focal Loss (logits) — 소수 클래스(A/H/M) Sens 강화 목적.
+  # 비교 대상: configs/v1.yaml (weighted_bce)
+  loss_type: "focal"
+  focal_gamma: 2.0
+  focal_use_pos_weight: true
+
+  # === Run tag ===
+  # weighted_bce 산출물과 같은 output_dir에서 공존하도록 suffix 분리.
+  # 산출물 이름: best_focal.pth, thresholds_focal.npy, history_focal.csv
+  run_tag: "focal"
+
 preprocessing:
-  variants: ["V0", "V1_L", "V1_LA", "V1_LB", "V1_LAB"]
   clip_limit: 2.0
   tile_grid_size: [8, 8]
-
-routing:
-  hard:
-    N: "V1_LA"
-    D: "V1_LB"
-    G: "V0"
-    C: "V1_LAB"
-    A: "V1_L"
-    H: "V1_LB"
-    M: "V1_L"
 
 output_dir: "analysis/v1_analysis"
