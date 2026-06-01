@@ -22,8 +22,8 @@ class V1LTrainer(BaseTrainer):
     """V1 — CLAHE on L channel only."""
 
     def _build_preprocessor(self, prep_cfg: dict):
-        from preprocessing.v1.clahe import V1Preprocessor
-        return V1Preprocessor(variant="V1_L", **prep_cfg)
+        from preprocessing.v1.clahe_L import V1LPreprocessor
+        return V1LPreprocessor(**prep_cfg)
 
 
 def main():
