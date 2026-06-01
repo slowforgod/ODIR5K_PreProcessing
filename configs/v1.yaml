@@ -6,10 +6,10 @@ class_names: ["N", "D", "G", "C", "A", "H", "M"]
 data:
   image_dir: "data/preprocessed_images"
   csv_path: "data/full_df.csv"
-  split_path: "data/patient_split_7class_stratified_811.json"   # 변경: 8:1:1
+  split_path: "data/patient_split_7class_stratified_811.json"
   split_train_key: "train_patients"
   split_val_key: "val_patients"
-  split_test_key: "test_patients"                                # 추가
+  split_test_key: "test_patients"
   patient_id_col: "ID"
   filename_col: "filename"
   class_cols: ["N", "D", "G", "C", "A", "H", "M"]
@@ -17,29 +17,19 @@ data:
 
 train:
   batch_size: 32
-  num_epochs: 20
-  lr: 1.0e-4
-  weight_decay: 1.0e-4
   dropout: 0.5
-  patience: 8
-  seed: 42
   device: "cuda"
   num_workers: 4
-  use_amp: true
 
 preprocessing:
-  variants: ["V0", "V1_L", "V1_LA", "V1_LB", "V1_LAB"]
   clip_limit: 2.0
   tile_grid_size: [8, 8]
 
-routing:
-  hard:
-    N: "V1_LA"
-    D: "V1_LB"
-    G: "V0"
-    C: "V1_LAB"
-    A: "V1_L"
-    H: "V1_LB"
-    M: "V1_L"
+# 각 variant의 best.pth / thresholds.npy 경로
+variants:
+  V1_L:   "analysis/v1_L_analysis"
+  V1_LA:  "analysis/v1_LA_analysis"
+  V1_LB:  "analysis/v1_LB_analysis"
+  V1_LAB: "analysis/v1_LAB_analysis"
 
 output_dir: "analysis/v1_analysis"

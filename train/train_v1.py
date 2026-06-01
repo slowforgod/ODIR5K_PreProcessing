@@ -1,29 +1,19 @@
 """
 train/train_v1.py
 
-Entry point for the redesigned V1 experiment: 5 CLAHE variants + per-class routing.
+V1 앙상블 추론 전용 스크립트.
+v1_L / v1_LA / v1_LB / v1_LAB 4개 variant의 best.pth를 로드하여
+soft routing (uniform average) 앙상블 후 결과 JSON 저장.
 
-Trains one ResNet-50 per variant sequentially, then combines results via
-hard routing and uniform soft routing on the validation set.
-Test set is evaluated with the best thresholds from val (no recomputation).
+훈련은 각각 train_v1_L / train_v1_LA / train_v1_LB / train_v1_LAB 로 진행.
 
 Usage:
     python -m train.train_v1 --config configs/v1.yaml
-    python -m train.train_v1 --config configs/v1.yaml --smoke
-
-변경 이력:
-  - split JSON: patient_split_7class_stratified.json (8:2)
-              → patient_split_7class_stratified_811.json (8:1:1)
-  - test split 로드 + test_loader 구성
-  - 각 variant 학습 후 test 평가 추가 (val threshold 재사용)
-  - 최종 JSON에 per_variant_test_metrics, routing test 결과 포함
 """
 
 import argparse
-import csv
 import json
 import os
-import random
 import sys
 import warnings
 from datetime import datetime
@@ -31,16 +21,14 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as T
 import yaml
 
 warnings.filterwarnings("ignore")
 
 CLASS_NAMES = ["N", "D", "G", "C", "A", "H", "M"]
-
 _IMAGENET_MEAN = [0.485, 0.456, 0.406]
 _IMAGENET_STD  = [0.229, 0.224, 0.225]
 
@@ -48,15 +36,6 @@ _IMAGENET_STD  = [0.229, 0.224, 0.225]
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def seed_everything(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
 
 def load_config(path: str) -> dict:
     with open(path) as f:
@@ -89,11 +68,7 @@ class ODIRV1Dataset(Dataset):
         class_cols: List[str],
         img_size: int = 224,
         preprocessor=None,
-        smoke_n: int = 0,
     ):
-        if smoke_n > 0:
-            df = df.head(smoke_n)
-
         self.preprocessor = preprocessor
         self._resize = T.Resize((img_size, img_size))
         self._to_tensor_norm = T.Compose([
@@ -132,56 +107,11 @@ class ODIRV1Dataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# DataLoader helpers
+# TTA 추론
 # ---------------------------------------------------------------------------
-
-def _compute_label_stats(dataset: ODIRV1Dataset) -> tuple:
-    labels = np.stack([s[1] for s in dataset.samples])
-    class_freq = labels.sum(axis=0).clip(min=1.0)
-    class_inv = 1.0 / class_freq
-    sample_weights = torch.tensor(
-        (labels * class_inv).sum(axis=1), dtype=torch.float32
-    )
-    pos_weight = torch.tensor(
-        (len(labels) - class_freq) / class_freq, dtype=torch.float32
-    )
-    return sample_weights, pos_weight
-
-
-# ---------------------------------------------------------------------------
-# Training loop (per variant)
-# ---------------------------------------------------------------------------
-
-def _train_one_epoch(model, loader, optimizer, criterion, device, scaler=None):
-    model.train()
-    total_loss = 0.0
-    use_amp = scaler is not None
-
-    for imgs, labels in loader:
-        imgs = imgs.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-        optimizer.zero_grad()
-
-        if use_amp:
-            with torch.amp.autocast(device_type="cuda"):
-                logits = model(imgs)
-                loss = criterion(logits, labels)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            logits = model(imgs)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
-
-        total_loss += loss.item()
-
-    return total_loss / max(len(loader), 1)
-
 
 @torch.no_grad()
-def _validate_tta(model, loader, device):
+def _infer_tta(model, loader, device):
     """Horizontal-flip TTA. Returns (probs, labels) ndarrays."""
     model.eval()
     all_probs, all_labels = [], []
@@ -201,55 +131,31 @@ def _validate_tta(model, loader, device):
 # Main
 # ---------------------------------------------------------------------------
 
-def train(cfg: dict, smoke: bool = False) -> None:
+def run(cfg: dict) -> None:
     import pandas as pd
     from model.base import build_model
     from preprocessing.v1.clahe import V1Preprocessor
-    from preprocessing.v1.routing import (
-        DEFAULT_HARD_ROUTING,
-        DEFAULT_VARIANTS,
-        hard_route,
-        soft_route_uniform,
-    )
-    from analysis.metrics import (
-        compute_metrics,
-        evaluate_with_tta,
-        find_optimal_thresholds,
-    )
+    from preprocessing.v1.routing import soft_route_uniform
+    from analysis.metrics import compute_metrics, find_optimal_thresholds, save_metrics
 
-    # ------------------------------------------------------------------ #
-    # Seed + device                                                        #
-    # ------------------------------------------------------------------ #
-    seed = cfg["train"].get("seed", 42)
-    seed_everything(seed)
-
+    # ── device ──────────────────────────────────────────────────────────
     requested = cfg["train"].get("device", "cpu")
-    if requested == "cuda" and not torch.cuda.is_available():
-        print("[info] CUDA requested but not available — using CPU.", file=sys.stderr)
-        device = torch.device("cpu")
-    else:
-        device = torch.device(requested if torch.cuda.is_available() else "cpu")
+    device = torch.device(requested if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
 
-    use_amp = cfg["train"].get("use_amp", False) and device.type == "cuda"
-
-    # ------------------------------------------------------------------ #
-    # Data loading + split  ★ test 추가                                   #
-    # ------------------------------------------------------------------ #
+    # ── data ────────────────────────────────────────────────────────────
     data_cfg = cfg["data"]
     df = pd.read_csv(data_cfg["csv_path"])
 
     with open(data_cfg["split_path"]) as fh:
         split_json = json.load(fh)
 
-    train_ids = set(split_json[data_cfg["split_train_key"]])
-    val_ids   = set(split_json[data_cfg["split_val_key"]])
-    # ★ test_patients — config에 키가 있을 때만 로드 (하위 호환)
-    test_key  = data_cfg.get("split_test_key")
-    test_ids  = set(split_json[test_key]) if test_key and test_key in split_json else None
+    val_ids  = set(split_json[data_cfg["split_val_key"]])
+    test_key = data_cfg.get("split_test_key")
+    test_ids = set(split_json[test_key]) if test_key and test_key in split_json else None
 
-    train_df = df[df[data_cfg["patient_id_col"]].isin(train_ids)].reset_index(drop=True)
-    val_df   = df[df[data_cfg["patient_id_col"]].isin(val_ids)].reset_index(drop=True)
-    test_df  = (
+    val_df  = df[df[data_cfg["patient_id_col"]].isin(val_ids)].reset_index(drop=True)
+    test_df = (
         df[df[data_cfg["patient_id_col"]].isin(test_ids)].reset_index(drop=True)
         if test_ids is not None else None
     )
@@ -259,347 +165,132 @@ def train(cfg: dict, smoke: bool = False) -> None:
     img_size    = int(data_cfg.get("img_size", 224))
     class_names = cfg.get("class_names", CLASS_NAMES)
     num_classes = cfg.get("num_classes", 7)
+    batch_size  = int(cfg["train"].get("batch_size", 32))
+    num_workers = int(cfg["train"].get("num_workers", 4))
+    dropout     = float(cfg["train"].get("dropout", 0.5))
 
-    smoke_train = 200 if smoke else 0
-    smoke_val   = 50  if smoke else 0
-    smoke_test  = 50  if smoke else 0
+    print(f"Val  : {len(val_df)} samples")
+    if test_df is not None:
+        print(f"Test : {len(test_df)} samples")
 
+    # ── variant 설정 ─────────────────────────────────────────────────────
+    # 각 variant의 best.pth 경로와 preprocessor 매핑
     pre_cfg    = cfg.get("preprocessing", {})
-    variants   = pre_cfg.get("variants", DEFAULT_VARIANTS)
     clip_limit = float(pre_cfg.get("clip_limit", 2.0))
     tile_grid  = tuple(pre_cfg.get("tile_grid_size", [8, 8]))
 
-    train_cfg    = cfg["train"]
-    batch_size   = int(train_cfg.get("batch_size", 32))
-    num_epochs   = 2 if smoke else int(train_cfg.get("num_epochs", 20))
-    patience     = int(train_cfg.get("patience", 8))
-    lr           = float(train_cfg.get("lr", 1e-4))
-    weight_decay = float(train_cfg.get("weight_decay", 1e-4))
-    dropout      = float(train_cfg.get("dropout", 0.5))
-    num_workers  = 0 if smoke else int(train_cfg.get("num_workers", 4))
+    variant_cfgs = cfg.get("variants", {})
+    # variant_cfgs 예시:
+    # variants:
+    #   V1_L:   analysis/v1_L_analysis
+    #   V1_LA:  analysis/v1_LA_analysis
+    #   V1_LB:  analysis/v1_LB_analysis
+    #   V1_LAB: analysis/v1_LAB_analysis
 
-    output_base = cfg.get("output_dir", "analysis/v1_analysis")
-    exp_name    = cfg.get("experiment_name", "v1_resnet50_seed42")
-    os.makedirs(output_base, exist_ok=True)
+    probs_val_by_variant:  Dict[str, np.ndarray] = {}
+    probs_test_by_variant: Dict[str, np.ndarray] = {}
+    val_labels_shared:     Optional[np.ndarray] = None
+    test_labels_shared:    Optional[np.ndarray] = None
+    per_variant_val:       Dict[str, dict] = {}
+    per_variant_test:      Dict[str, dict] = {}
 
-    routing_cfg = cfg.get("routing", {}).get("hard", DEFAULT_HARD_ROUTING)
-    log_thresholds = np.full(num_classes, 0.5, dtype=np.float32)
-
-    per_variant_metrics:      Dict[str, dict] = {}
-    per_variant_test_metrics: Dict[str, dict] = {}   # ★ test
-    probs_by_variant:         Dict[str, np.ndarray] = {}
-    test_probs_by_variant:    Dict[str, np.ndarray] = {}  # ★ test
-    val_labels_shared:        Optional[np.ndarray] = None
-    test_labels_shared:       Optional[np.ndarray] = None  # ★ test
-
-    cached_sampler_weights: Optional[torch.Tensor] = None
-    cached_pos_weight_dev:  Optional[torch.Tensor] = None
-
-    print(f"  Train : {len(train_df)} samples")
-    print(f"  Val   : {len(val_df)} samples")
-    if test_df is not None:
-        print(f"  Test  : {len(test_df)} samples")
-
-    # ------------------------------------------------------------------ #
-    # 5-variant training loop                                              #
-    # ------------------------------------------------------------------ #
-    for v_idx, variant in enumerate(variants, start=1):
+    for variant, variant_dir in variant_cfgs.items():
         print(f"\n{'='*60}")
-        print(f"[Variant {v_idx}/{len(variants)}: {variant}]")
-        print(f"{'='*60}")
+        print(f"[{variant}] Loading from {variant_dir}")
 
-        variant_dir = os.path.join(output_base, variant)
-        os.makedirs(variant_dir, exist_ok=True)
+        ckpt_path = os.path.join(variant_dir, "best.pth")
+        thr_path  = os.path.join(variant_dir, "thresholds.npy")
 
+        if not os.path.isfile(ckpt_path):
+            print(f"  [skip] best.pth not found: {ckpt_path}")
+            continue
+        if not os.path.isfile(thr_path):
+            print(f"  [skip] thresholds.npy not found: {thr_path}")
+            continue
+
+        # 모델 로드
+        model = build_model(
+            name=cfg["model_name"],
+            num_classes=num_classes,
+            pretrained=False,
+            dropout=dropout,
+        ).to(device)
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        thresholds = np.load(thr_path)
+
+        # preprocessor
         preprocessor = V1Preprocessor(
             variant=variant,
             clip_limit=clip_limit,
             tile_grid_size=tile_grid,
         )
 
-        train_ds = ODIRV1Dataset(
-            train_df, image_dir, class_cols,
-            img_size=img_size, preprocessor=preprocessor, smoke_n=smoke_train,
-        )
-        val_ds = ODIRV1Dataset(
-            val_df, image_dir, class_cols,
-            img_size=img_size, preprocessor=preprocessor, smoke_n=smoke_val,
-        )
-        # ★ test_ds
-        test_ds = (
-            ODIRV1Dataset(
-                test_df, image_dir, class_cols,
-                img_size=img_size, preprocessor=preprocessor, smoke_n=smoke_test,
-            ) if test_df is not None else None
-        )
+        # val 추론
+        val_ds = ODIRV1Dataset(val_df, image_dir, class_cols, img_size, preprocessor)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        val_probs, val_labels = _infer_tta(model, val_loader, device)
 
-        print(f"  Train: {len(train_ds)}  Val: {len(val_ds)}"
-              + (f"  Test: {len(test_ds)}" if test_ds else ""))
+        if val_labels_shared is None:
+            val_labels_shared = val_labels
+        probs_val_by_variant[variant] = val_probs
 
-        if cached_sampler_weights is None:
-            cached_sampler_weights, pos_weight_cpu = _compute_label_stats(train_ds)
-            cached_pos_weight_dev = pos_weight_cpu.to(device)
+        val_metrics = compute_metrics(val_labels, val_probs, thresholds, class_names)
+        per_variant_val[variant] = {**val_metrics, "thresholds": thresholds.tolist()}
+        print(f"  [val]  auc={val_metrics['macro_auc']:.4f}  f1={val_metrics['macro_f1']:.4f}  kappa={val_metrics['kappa']:.4f}")
 
-        sampler = WeightedRandomSampler(
-            cached_sampler_weights,
-            num_samples=len(cached_sampler_weights),
-            replacement=True,
-        )
-        train_loader = DataLoader(
-            train_ds, batch_size=batch_size, sampler=sampler,
-            num_workers=num_workers, pin_memory=(device.type == "cuda"),
-        )
-        val_loader = DataLoader(
-            val_ds, batch_size=batch_size, shuffle=False,
-            num_workers=num_workers, pin_memory=(device.type == "cuda"),
-        )
-        # ★ test_loader
-        test_loader = (
-            DataLoader(
-                test_ds, batch_size=batch_size, shuffle=False,
-                num_workers=num_workers, pin_memory=(device.type == "cuda"),
-            ) if test_ds is not None else None
-        )
+        # test 추론
+        if test_df is not None:
+            test_ds = ODIRV1Dataset(test_df, image_dir, class_cols, img_size, preprocessor)
+            test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+            test_probs, test_labels = _infer_tta(model, test_loader, device)
 
-        seed_everything(seed)
-        model = build_model(
-            name=cfg["model_name"],
-            num_classes=num_classes,
-            pretrained=True,
-            dropout=dropout,
-        ).to(device)
+            if test_labels_shared is None:
+                test_labels_shared = test_labels
+            probs_test_by_variant[variant] = test_probs
 
-        criterion = nn.BCEWithLogitsLoss(pos_weight=cached_pos_weight_dev)
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-        scaler    = torch.amp.GradScaler("cuda") if use_amp else None
-
-        history_path   = os.path.join(variant_dir, "history.csv")
-        history_fields = ["epoch", "train_loss", "val_loss", "val_macro_auc", "val_macro_f1", "val_kappa"]
-        with open(history_path, "w", newline="") as hf:
-            csv.DictWriter(hf, fieldnames=history_fields).writeheader()
-
-        best_auc   = -1.0
-        no_improve = 0
-        best_epoch = 0
-        ckpt_path  = os.path.join(variant_dir, "best.pth")
-
-        for epoch in range(1, num_epochs + 1):
-            train_loss = _train_one_epoch(model, train_loader, optimizer, criterion, device, scaler)
-            val_probs, val_labels = _validate_tta(model, val_loader, device)
-
-            val_loss = float(
-                nn.BCELoss()(
-                    torch.tensor(val_probs, dtype=torch.float32),
-                    torch.tensor(val_labels, dtype=torch.float32),
-                ).item()
-            )
-            epoch_metrics = compute_metrics(val_labels, val_probs, log_thresholds, class_names)
-            val_auc   = epoch_metrics["macro_auc"]
-            val_f1    = epoch_metrics["macro_f1"]
-            val_kappa = epoch_metrics["kappa"]
-
-            scheduler.step()
-
-            print(
-                f"  Epoch {epoch:03d}/{num_epochs} | "
-                f"loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
-                f"val_auc={val_auc:.4f} | val_f1={val_f1:.4f} | val_kappa={val_kappa:.4f}"
-            )
-
-            with open(history_path, "a", newline="") as hf:
-                writer = csv.DictWriter(hf, fieldnames=history_fields)
-                writer.writerow({
-                    "epoch": epoch,
-                    "train_loss": round(train_loss, 6),
-                    "val_loss": round(val_loss, 6),
-                    "val_macro_auc": round(val_auc, 6),
-                    "val_macro_f1": round(val_f1, 6),
-                    "val_kappa": round(val_kappa, 6),
-                })
-
-            if not np.isnan(val_auc) and val_auc > best_auc:
-                best_auc = val_auc
-                best_epoch = epoch
-                no_improve = 0
-                torch.save(model.state_dict(), ckpt_path)
-                print(f"    [saved] best.pth (val_auc={best_auc:.4f})")
-            else:
-                no_improve += 1
-                if no_improve >= patience:
-                    print(f"  [early stop] no improvement for {patience} epochs")
-                    break
-
-        # ---- Post-training: reload best.pth, val TTA eval ----
-        if best_auc >= 0 and os.path.isfile(ckpt_path):
-            print(f"\n  [reload] Loading best.pth (epoch {best_epoch}) ...")
-            model.load_state_dict(torch.load(ckpt_path, map_location=device))
-
-            # val 평가 + threshold 최적화
-            eval_result = evaluate_with_tta(
-                model, val_loader, device, num_classes,
-                thresholds=None,          # val에서 threshold 최적화
-                class_names=class_names,
-            )
-            thresholds = eval_result["thresholds"]
-            np.save(os.path.join(variant_dir, "thresholds.npy"), thresholds)
-
-            probs_by_variant[variant] = eval_result["probs"]
-            if val_labels_shared is None:
-                val_labels_shared = eval_result["labels"]
-
-            per_variant_metrics[variant] = {
-                "macro_auc":     eval_result["macro_auc"],
-                "per_class_auc": eval_result["per_class_auc"],
-                "macro_f1":      eval_result["macro_f1"],
-                "kappa":         eval_result["kappa"],
-                "sensitivity":   eval_result["sensitivity"],
-                "specificity":   eval_result["specificity"],
-                "thresholds":    thresholds.tolist(),
-                "best_epoch":    best_epoch,
-            }
-            print(
-                f"  [val]  auc={eval_result['macro_auc']:.4f}  "
-                f"f1={eval_result['macro_f1']:.4f}  "
-                f"kappa={eval_result['kappa']:.4f}"
-            )
-
-            # ★ test 평가 — val threshold 재사용 (재계산 금지)
-            if test_loader is not None:
-                test_result = evaluate_with_tta(
-                    model, test_loader, device, num_classes,
-                    thresholds=thresholds,   # val threshold 재사용
-                    class_names=class_names,
-                )
-                test_probs_by_variant[variant] = test_result["probs"]
-                if test_labels_shared is None:
-                    test_labels_shared = test_result["labels"]
-
-                per_variant_test_metrics[variant] = {
-                    "macro_auc":     test_result["macro_auc"],
-                    "per_class_auc": test_result["per_class_auc"],
-                    "macro_f1":      test_result["macro_f1"],
-                    "kappa":         test_result["kappa"],
-                    "sensitivity":   test_result["sensitivity"],
-                    "specificity":   test_result["specificity"],
-                }
-                print(
-                    f"  [test] auc={test_result['macro_auc']:.4f}  "
-                    f"f1={test_result['macro_f1']:.4f}  "
-                    f"kappa={test_result['kappa']:.4f}"
-                )
-        else:
-            print(f"  [warn] No improvement recorded for variant {variant}.")
-            probs_by_variant[variant] = np.zeros(
-                (len(val_ds), num_classes), dtype=np.float32
-            )
-            per_variant_metrics[variant] = {
-                "macro_auc": None, "per_class_auc": {},
-                "macro_f1": None, "kappa": None,
-                "sensitivity": {}, "specificity": {},
-                "thresholds": [], "best_epoch": 0,
-            }
-            if test_loader is not None:
-                test_probs_by_variant[variant] = np.zeros(
-                    (len(test_ds), num_classes), dtype=np.float32
-                )
-                per_variant_test_metrics[variant] = {
-                    "macro_auc": None, "per_class_auc": {},
-                    "macro_f1": None, "kappa": None,
-                    "sensitivity": {}, "specificity": {},
-                }
+            test_metrics = compute_metrics(test_labels, test_probs, thresholds, class_names)
+            per_variant_test[variant] = test_metrics
+            print(f"  [test] auc={test_metrics['macro_auc']:.4f}  f1={test_metrics['macro_f1']:.4f}  kappa={test_metrics['kappa']:.4f}")
 
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    # ------------------------------------------------------------------ #
-    # Routing aggregation — val                                            #
-    # ------------------------------------------------------------------ #
+    # ── soft routing 앙상블 ──────────────────────────────────────────────
     print(f"\n{'='*60}")
-    print("Computing routing metrics...")
-    assert val_labels_shared is not None, "No variant produced a valid eval result."
+    print("Soft routing (uniform average) 앙상블...")
+    assert val_labels_shared is not None, "No variant produced a valid result."
 
-    routing_metrics: Dict[str, dict] = {}
+    # val soft routing
+    prob_soft_val = soft_route_uniform(probs_val_by_variant, class_names)
+    thr_soft      = find_optimal_thresholds(prob_soft_val, val_labels_shared, num_classes)
+    met_soft_val  = compute_metrics(val_labels_shared, prob_soft_val, thr_soft, class_names)
+    print(f"  [val]  auc={met_soft_val['macro_auc']:.4f}  f1={met_soft_val['macro_f1']:.4f}  kappa={met_soft_val['kappa']:.4f}")
 
-    prob_hard = hard_route(probs_by_variant, class_names, routing_cfg)
-    thr_hard  = find_optimal_thresholds(prob_hard, val_labels_shared, num_classes)
-    met_hard  = compute_metrics(val_labels_shared, prob_hard, thr_hard, class_names)
-    routing_metrics["hard"] = {
-        "routing_map":   routing_cfg,
-        "macro_auc":     met_hard["macro_auc"],
-        "per_class_auc": met_hard["per_class_auc"],
-        "macro_f1":      met_hard["macro_f1"],
-        "kappa":         met_hard["kappa"],
-        "sensitivity":   met_hard["sensitivity"],
-        "specificity":   met_hard["specificity"],
-        "thresholds":    thr_hard.tolist(),
-    }
-
-    prob_soft = soft_route_uniform(probs_by_variant, class_names)
-    thr_soft  = find_optimal_thresholds(prob_soft, val_labels_shared, num_classes)
-    met_soft  = compute_metrics(val_labels_shared, prob_soft, thr_soft, class_names)
-    routing_metrics["soft_uniform"] = {
-        "weighting":     "uniform across all 5 variants",
-        "macro_auc":     met_soft["macro_auc"],
-        "per_class_auc": met_soft["per_class_auc"],
-        "macro_f1":      met_soft["macro_f1"],
-        "kappa":         met_soft["kappa"],
-        "sensitivity":   met_soft["sensitivity"],
-        "specificity":   met_soft["specificity"],
-        "thresholds":    thr_soft.tolist(),
-    }
-
-    print(f"  [val] Hard routing   → auc={met_hard['macro_auc']:.4f}  f1={met_hard['macro_f1']:.4f}")
-    print(f"  [val] Soft (uniform) → auc={met_soft['macro_auc']:.4f}  f1={met_soft['macro_f1']:.4f}")
-
-    # ★ Routing aggregation — test
-    test_routing_metrics: Dict[str, dict] = {}
+    # test soft routing — val threshold 재사용
+    met_soft_test = None
     if test_labels_shared is not None:
-        # hard routing test: val threshold 재사용
-        prob_hard_test = hard_route(test_probs_by_variant, class_names, routing_cfg)
-        met_hard_test  = compute_metrics(test_labels_shared, prob_hard_test, thr_hard, class_names)
-        test_routing_metrics["hard"] = {
-            "routing_map":   routing_cfg,
-            "macro_auc":     met_hard_test["macro_auc"],
-            "per_class_auc": met_hard_test["per_class_auc"],
-            "macro_f1":      met_hard_test["macro_f1"],
-            "kappa":         met_hard_test["kappa"],
-            "sensitivity":   met_hard_test["sensitivity"],
-            "specificity":   met_hard_test["specificity"],
-        }
-
-        # soft routing test: val threshold 재사용
-        prob_soft_test = soft_route_uniform(test_probs_by_variant, class_names)
+        prob_soft_test = soft_route_uniform(probs_test_by_variant, class_names)
         met_soft_test  = compute_metrics(test_labels_shared, prob_soft_test, thr_soft, class_names)
-        test_routing_metrics["soft_uniform"] = {
-            "weighting":     "uniform across all 5 variants",
-            "macro_auc":     met_soft_test["macro_auc"],
-            "per_class_auc": met_soft_test["per_class_auc"],
-            "macro_f1":      met_soft_test["macro_f1"],
-            "kappa":         met_soft_test["kappa"],
-            "sensitivity":   met_soft_test["sensitivity"],
-            "specificity":   met_soft_test["specificity"],
-        }
+        print(f"  [test] auc={met_soft_test['macro_auc']:.4f}  f1={met_soft_test['macro_f1']:.4f}  kappa={met_soft_test['kappa']:.4f}")
 
-        print(f"  [test] Hard routing   → auc={met_hard_test['macro_auc']:.4f}  f1={met_hard_test['macro_f1']:.4f}")
-        print(f"  [test] Soft (uniform) → auc={met_soft_test['macro_auc']:.4f}  f1={met_soft_test['macro_f1']:.4f}")
+    # ── 결과 저장 ────────────────────────────────────────────────────────
+    output_base = cfg.get("output_dir", "analysis/v1_analysis")
+    exp_name    = cfg.get("experiment_name", "v1_resnet50_seed42")
+    os.makedirs(output_base, exist_ok=True)
 
-    # ------------------------------------------------------------------ #
-    # Save combined JSON                                                   #
-    # ------------------------------------------------------------------ #
     combined = {
-        "experiment_name":         exp_name,
-        "timestamp":               datetime.utcnow().isoformat() + "Z",
-        "config_snapshot":         cfg,
-        "split":                   "8:1:1",
+        "experiment_name": exp_name,
+        "timestamp":       datetime.utcnow().isoformat() + "Z",
+        "config_snapshot": cfg,
+        "split":           "8:1:1",
         "val": {
-            "per_variant_metrics": _to_serializable(per_variant_metrics),
-            "routing_metrics":     _to_serializable(routing_metrics),
+            "per_variant_metrics": _to_serializable(per_variant_val),
+            "soft_routing":        _to_serializable({**met_soft_val, "thresholds": thr_soft.tolist()}),
         },
         "test": {
-            "per_variant_metrics": _to_serializable(per_variant_test_metrics),
-            "routing_metrics":     _to_serializable(test_routing_metrics),
+            "per_variant_metrics": _to_serializable(per_variant_test),
+            "soft_routing":        _to_serializable(met_soft_test),
         } if test_labels_shared is not None else None,
     }
 
@@ -607,7 +298,7 @@ def train(cfg: dict, smoke: bool = False) -> None:
     with open(json_path, "w") as fh:
         json.dump(combined, fh, indent=2)
 
-    print(f"\nCombined results → {json_path}")
+    print(f"\nResults saved → {json_path}")
     print("Done.")
 
 
@@ -616,17 +307,10 @@ def train(cfg: dict, smoke: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train V1 multi-variant CLAHE experiment")
+    parser = argparse.ArgumentParser(description="V1 soft routing ensemble inference")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
-    parser.add_argument(
-        "--smoke",
-        action="store_true",
-        help="Quick smoke test: 200 train / 50 val, 2 epochs per variant",
-    )
     args = parser.parse_args()
-
-    cfg = load_config(args.config)
-    train(cfg, smoke=args.smoke)
+    run(load_config(args.config))
 
 
 if __name__ == "__main__":
