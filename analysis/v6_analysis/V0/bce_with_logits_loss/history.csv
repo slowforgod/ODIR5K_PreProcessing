@@ -1,0 +1,2 @@
+epoch,train_loss,val_loss,val_macro_auc,val_macro_f1,val_kappa
+1,0.584168,0.496087,0.726188,0.252205,0.142857

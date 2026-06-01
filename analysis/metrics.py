@@ -29,38 +29,81 @@ from sklearn.metrics import (
 # find_optimal_thresholds
 # ---------------------------------------------------------------------------
 
+_THRESHOLD_CANDIDATES = np.arange(0.05, 0.96, 0.01)
+
+
+def _best_threshold_vectorised(
+    probs_c: np.ndarray,
+    labels_c: np.ndarray,
+    candidates: np.ndarray = _THRESHOLD_CANDIDATES,
+) -> float:
+    """F1-maximising threshold for one class via fully vectorised TP/FP/FN."""
+    pred = probs_c[None, :] >= candidates[:, None]          # (T, N) bool
+    pos = labels_c.astype(bool)[None, :]                    # (1, N) bool
+    tp = (pred & pos).sum(axis=1).astype(np.float64)        # (T,)
+    fp = (pred & ~pos).sum(axis=1).astype(np.float64)
+    fn = (~pred & pos).sum(axis=1).astype(np.float64)
+    denom = 2.0 * tp + fp + fn
+    f1 = np.where(denom > 0, 2.0 * tp / denom, 0.0)
+    return float(candidates[int(np.argmax(f1))])
+
+
 def find_optimal_thresholds(
     probs: np.ndarray,
     labels: np.ndarray,
     num_classes: int,
+    n_bootstrap: int = 500,
+    seed: int = 42,
 ) -> np.ndarray:
-    """Find per-class F1-maximising decision thresholds.
+    """Find per-class F1-maximising thresholds via bootstrap resampling.
 
-    Search range: np.arange(0.05, 0.96, 0.01) (0.05 ~ 0.95, step 0.01).
+    For each class:
+      1. Draw `n_bootstrap` resamples of (probs, labels) with replacement.
+      2. On each resample, pick the F1-maximising threshold on a grid
+         (0.05 ~ 0.95, step 0.01).
+      3. Return the median of the bootstrap thresholds.
+
+    Median aggregation makes the threshold robust to the small val set
+    (≈ 551 samples) and to rare-class noise. With `seed` fixed the result
+    is deterministic.
+
+    Search range: np.arange(0.05, 0.96, 0.01).
     If a class has no positive samples the threshold defaults to 0.5.
 
     Args:
-        probs      : (N, num_classes) sigmoid probabilities
-        labels     : (N, num_classes) multi-hot ground truth
-        num_classes: number of classes
+        probs       : (N, num_classes) sigmoid probabilities
+        labels      : (N, num_classes) multi-hot ground truth
+        num_classes : number of classes
+        n_bootstrap : number of bootstrap resamples (default 500)
+        seed        : RNG seed for reproducibility (default 42)
 
     Returns:
         thresholds : (num_classes,) float32 array
     """
     thresholds = np.full(num_classes, 0.5, dtype=np.float32)
-    candidates = np.arange(0.05, 0.96, 0.01)
+    n = len(probs)
+    if n == 0:
+        return thresholds
+
+    rng = np.random.default_rng(seed)
 
     for c in range(num_classes):
         if labels[:, c].sum() == 0:
-            # No positives — keep 0.5 and skip
             continue
-        best_f1, best_t = -1.0, 0.5
-        for t in candidates:
-            pred_c = (probs[:, c] >= t).astype(int)
-            f1c = f1_score(labels[:, c], pred_c, zero_division=0)
-            if f1c > best_f1:
-                best_f1, best_t = f1c, float(t)
-        thresholds[c] = best_t
+
+        boot_ts = []
+        for _ in range(n_bootstrap):
+            idx = rng.integers(0, n, size=n)
+            y_b = labels[idx, c]
+            if y_b.sum() == 0:
+                continue
+            p_b = probs[idx, c]
+            boot_ts.append(_best_threshold_vectorised(p_b, y_b))
+
+        if boot_ts:
+            thresholds[c] = float(np.median(boot_ts))
+        else:
+            thresholds[c] = _best_threshold_vectorised(probs[:, c], labels[:, c])
 
     return thresholds
 
