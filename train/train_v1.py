@@ -154,7 +154,11 @@ def _infer_tta(model, loader, device):
 def run(cfg: dict) -> None:
     import pandas as pd
     from model.base import build_model
-    from preprocessing.v1.routing import hard_route, soft_route_uniform
+    from preprocessing.v1.routing import (
+        auto_route_from_val,
+        hard_route,
+        soft_route_uniform,
+    )
     from analysis.metrics import compute_metrics, find_optimal_thresholds
 
     # ── device ──────────────────────────────────────────────────────────
@@ -192,7 +196,6 @@ def run(cfg: dict) -> None:
     clip_limit = float(pre_cfg.get("clip_limit", 2.0))
     tile_grid  = tuple(pre_cfg.get("tile_grid_size", [8, 8]))
 
-    routing_hard = cfg.get("routing", {}).get("hard", {})
     variant_cfgs = cfg.get("variants", {})
 
     print(f"Val  : {len(val_df)} samples")
@@ -205,6 +208,7 @@ def run(cfg: dict) -> None:
     test_labels_shared:    Optional[np.ndarray] = None
     per_variant_val:       Dict[str, dict] = {}
     per_variant_test:      Dict[str, dict] = {}
+    thresholds_by_variant: Dict[str, np.ndarray] = {}
 
     # ── 각 variant 추론 ──────────────────────────────────────────────────
     for variant, variant_dir in variant_cfgs.items():
@@ -229,6 +233,7 @@ def run(cfg: dict) -> None:
         ).to(device)
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
         thresholds = np.load(thr_path)
+        thresholds_by_variant[variant] = thresholds
 
         preprocessor = _build_preprocessor(variant, clip_limit, tile_grid)
 
@@ -280,9 +285,18 @@ def run(cfg: dict) -> None:
         met_soft_test  = compute_metrics(test_labels_shared, prob_soft_test, thr_soft, class_names)
         print(f"  [test] auc={met_soft_test['macro_auc']:.4f}  f1={met_soft_test['macro_f1']:.4f}  kappa={met_soft_test['kappa']:.4f}")
 
-    # ── hard routing 앙상블 ──────────────────────────────────────────────
+    # ── auto hard routing (val F1 기준으로 클래스별 best variant 자동 선정) ──
     print(f"\n{'='*60}")
-    print("Hard routing...")
+    print("Auto hard routing (per-class best variant from val F1)...")
+
+    routing_hard = auto_route_from_val(
+        probs_val_by_variant,
+        val_labels_shared,
+        class_names,
+        thresholds_by_variant=thresholds_by_variant,
+    )
+    for cls in class_names:
+        print(f"  {cls}: {routing_hard[cls]}")
 
     prob_hard_val = hard_route(probs_val_by_variant, class_names, routing_hard)
     thr_hard      = find_optimal_thresholds(prob_hard_val, val_labels_shared, num_classes)

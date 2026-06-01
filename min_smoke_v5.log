@@ -1,0 +1,18 @@
+[info] CUDA requested but not available — using CPU.
+[CB weights from train_df (4389 rows)]
+  N: 0.2053
+  D: 0.2031
+  G: 1.0132
+  C: 1.0070
+  A: 1.2595
+  H: 1.9856
+  M: 1.3263
+
+============================================================
+[Variant 1/1: V0]
+============================================================
+  Train: 200  Val: 50
+
+  [V0] Loss 1/1: bce_with_logits_loss
+    Epoch 001/2 | loss=0.5942 | val_loss=0.5360 | val_auc=0.7266 | val_f1=0.2838 | val_kappa=0.2084
+      [saved] best.pth (val_auc=0.7266)

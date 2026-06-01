@@ -1,0 +1,72 @@
+experiment_name: "v6_resnet50_seed42"
+model_name: "resnet50"
+num_classes: 7
+class_names: ["N", "D", "G", "C", "A", "H", "M"]
+
+data:
+  image_dir: "data/preprocessed_images"
+  csv_path: "data/full_df.csv"
+  split_path: "data/patient_split_7class_stratified.json"
+  split_train_key: "train_patients"
+  split_val_key: "val_patients"
+  patient_id_col: "ID"
+  filename_col: "filename"
+  class_cols: ["N", "D", "G", "C", "A", "H", "M"]
+  img_size: 224
+
+train:
+  batch_size: 32
+  num_epochs: 20
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  dropout: 0.5
+  patience: 8
+  seed: 42
+  device: "cuda"
+  num_workers: 4
+  use_amp: true
+  optimizer: "adam"    # V2 recipe — plain Adam
+
+preprocessing:
+  # V1 CLAHE — V0 제외 (V4/V5 와 통일)
+  variants: ["V1_L", "V1_LA", "V1_LB", "V1_LAB"]
+  clip_limit: 2.0
+  tile_grid_size: [8, 8]
+  # V2 LSE oversampling
+  lse_target_mode: "custom"
+  lse_custom_target_count: 850
+  lse_max_aug_per_source: 12
+  # V2 Augmentation
+  hflip_p: 0.5
+  vflip_p: 0.1
+  geo_p: 0.8
+  rotate_limit: 20
+  affine_scale: [0.85, 1.15]
+  affine_translate: 0.07
+  affine_rotate: 15
+  affine_shear: 5
+  crop_scale: [0.82, 1.0]
+  color_jitter_p: 0.3
+  brightness: 0.1
+  contrast: 0.1
+  saturation: 0.05
+  blur_p: 0.2
+  blur_limit: [3, 5]
+  # V3 Manifold Mixup (handled in trainer)
+  mixup_alpha: 0.2
+  mixup_layers: [0, 1, 2, 3]
+
+losses:
+  experiments: ["robust_asymmetric_loss", "cb_bce_with_logits_loss", "cb_focal_loss"]
+  focal_alpha: 0.75
+  focal_gamma: 2.0
+  ral_gamma_neg: 2.0
+  ral_gamma_pos: 1.0
+  ral_clip: 0.05
+  ral_lambda: 1.5
+  ral_pos_terms: 2
+  ral_neg_terms: 2
+  cb_beta: 0.9999
+  cb_weight_normalize: "mean_one"
+
+output_dir: "analysis/v6_analysis"

@@ -190,7 +190,7 @@ class BaseTrainer:
             train_cfg["device"] if torch.cuda.is_available() else "cpu"
         )
         self.use_amp = train_cfg.get("use_amp", True) and self.device.type == "cuda"
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
         # ── Split 로드 ──────────────────────────────────────────────────
         df = pd.read_csv(data_cfg["csv_path"])
@@ -335,7 +335,7 @@ class BaseTrainer:
             imgs   = imgs.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
             self.optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
                 logits = self.model(imgs)
                 loss   = self.criterion(logits, labels)
             self.scaler.scale(loss).backward()
