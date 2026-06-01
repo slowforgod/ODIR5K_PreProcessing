@@ -3,11 +3,9 @@ preprocessing/v6/preprocess.py
 
 V6Preprocessor: V1 (CLAHE) + V2 (augmentation) combined dataset-side preprocessor.
 V3 Manifold Mixup is handled by the trainer, not the dataset.
-
 Identical to V4Preprocessor in structure. Both apply V1 then V2 in sequence,
 and both are training-only (val set uses V1 only, no V2 augmentation).
 """
-
 from preprocessing.v1.clahe import V1Preprocessor
 from preprocessing.v2.augmentation import V2Preprocessor
 
