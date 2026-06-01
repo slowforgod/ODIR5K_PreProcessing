@@ -205,8 +205,17 @@ def train_one_epoch(
     alpha: float,
     mixup_layers: list,
     scaler=None,
+    mixup_prob: float = 1.0,
+    grad_clip: float = 0.0,
 ):
-    """One training epoch with Manifold Mixup for V6."""
+    """One training epoch with Manifold Mixup for V6.
+
+    Args:
+        mixup_prob : probability of applying Manifold Mixup per batch.
+                     Remaining batches do a plain forward to keep raw label
+                     distribution in the gradient signal.
+        grad_clip  : max gradient norm (0 disables). AMP-aware.
+    """
     model.train()
     total_loss = 0.0
     use_amp = scaler is not None
@@ -216,19 +225,39 @@ def train_one_epoch(
         labels = labels.to(device, non_blocking=True)
         optimizer.zero_grad()
 
+        do_mixup = (alpha > 0.0) and (np.random.rand() < mixup_prob)
+
         if use_amp:
             with torch.amp.autocast(device_type="cuda"):
-                out = model(imgs, y=labels, alpha=alpha, mixup_layers=mixup_layers)
-                logits, label_a, label_b, lam = out
-                loss = lam * criterion(logits, label_a) + (1.0 - lam) * criterion(logits, label_b)
+                if do_mixup:
+                    logits, label_a, label_b, lam = model(
+                        imgs, y=labels, alpha=alpha, mixup_layers=mixup_layers,
+                    )
+                    # NaN guard: ensure λ ≥ 0.5 so dominant term never vanishes
+                    lam = max(lam, 1.0 - lam)
+                    loss = lam * criterion(logits, label_a) + (1.0 - lam) * criterion(logits, label_b)
+                else:
+                    logits = model(imgs)
+                    loss = criterion(logits, labels)
             scaler.scale(loss).backward()
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
         else:
-            out = model(imgs, y=labels, alpha=alpha, mixup_layers=mixup_layers)
-            logits, label_a, label_b, lam = out
-            loss = lam * criterion(logits, label_a) + (1.0 - lam) * criterion(logits, label_b)
+            if do_mixup:
+                logits, label_a, label_b, lam = model(
+                    imgs, y=labels, alpha=alpha, mixup_layers=mixup_layers,
+                )
+                lam = max(lam, 1.0 - lam)
+                loss = lam * criterion(logits, label_a) + (1.0 - lam) * criterion(logits, label_b)
+            else:
+                logits = model(imgs)
+                loss = criterion(logits, labels)
             loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
         total_loss += loss.item()
@@ -338,8 +367,9 @@ def train(cfg: dict, smoke: bool = False) -> None:
     variants    = pre_cfg.get("variants", DEFAULT_VARIANTS)
     clip_limit  = float(pre_cfg.get("clip_limit", 2.0))
     tile_grid   = tuple(pre_cfg.get("tile_grid_size", [8, 8]))
-    alpha       = float(pre_cfg.get("mixup_alpha", 0.2))
+    alpha        = float(pre_cfg.get("mixup_alpha", 0.2))
     mixup_layers = list(pre_cfg.get("mixup_layers", [0, 1, 2, 3]))
+    mixup_prob   = float(pre_cfg.get("mixup_prob", 1.0))
 
     aug_kwargs = {
         k: pre_cfg[k]
@@ -361,6 +391,8 @@ def train(cfg: dict, smoke: bool = False) -> None:
     weight_decay = float(train_cfg.get("weight_decay", 1e-4))
     dropout      = float(train_cfg.get("dropout", 0.5))
     num_workers  = 0 if smoke else int(train_cfg.get("num_workers", 4))
+    grad_clip    = float(train_cfg.get("grad_clip", 0.0))
+    eta_min      = float(train_cfg.get("eta_min", 0.0))
 
     loss_experiments = cfg.get("losses", {}).get(
         "experiments",
@@ -465,7 +497,7 @@ def train(cfg: dict, smoke: bool = False) -> None:
                 model.parameters(), lr=lr, weight_decay=weight_decay
             )
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=num_epochs
+                optimizer, T_max=num_epochs, eta_min=eta_min,
             )
             scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
@@ -483,7 +515,8 @@ def train(cfg: dict, smoke: bool = False) -> None:
             for epoch in range(1, num_epochs + 1):
                 train_loss = train_one_epoch(
                     model, train_loader, optimizer, criterion,
-                    device, alpha, mixup_layers, scaler
+                    device, alpha, mixup_layers, scaler,
+                    mixup_prob=mixup_prob, grad_clip=grad_clip,
                 )
 
                 # Validation: standard forward (no Mixup) + HF TTA

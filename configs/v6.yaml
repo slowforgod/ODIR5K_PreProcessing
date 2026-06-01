@@ -19,13 +19,15 @@ train:
   num_epochs: 20
   lr: 1.0e-4
   weight_decay: 1.0e-4
-  dropout: 0.5
+  dropout: 0.3                 # ↓ 0.5 → 0.3 : mixup이 regularization 보조
   patience: 8
   seed: 42
   device: "cuda"
   num_workers: 4
   use_amp: true
   optimizer: "adam"    # V2 recipe — plain Adam
+  grad_clip: 1.0               # gradient norm clipping (AMP-aware)
+  eta_min: 1.0e-6              # CosineAnnealingLR 최저 lr (0으로 죽지 않게)
 
 preprocessing:
   # V1 CLAHE — V0 제외 (V4/V5 와 통일)
@@ -55,6 +57,7 @@ preprocessing:
   # V3 Manifold Mixup (handled in trainer)
   mixup_alpha: 0.2
   mixup_layers: [0, 1, 2, 3]
+  mixup_prob: 0.5              # 50% batch만 mixup, 나머지 50%는 raw 학습
 
 losses:
   experiments: ["robust_asymmetric_loss", "cb_bce_with_logits_loss", "cb_focal_loss"]
