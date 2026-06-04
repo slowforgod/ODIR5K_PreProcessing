@@ -17,7 +17,7 @@ def build_model(
     """Build and return a model by name.
 
     Args:
-        name        : "resnet50" | "densenet" | "efficientnet"
+        name        : "resnet50" | "resnet101" | "densenet" | "efficientnet"
         num_classes : output classes (default 7: N D G C A H M)
         pretrained  : load ImageNet weights (default True)
         dropout     : Dropout rate before final FC (default 0.5)
@@ -39,11 +39,19 @@ def build_model(
             dropout=dropout,
         )
 
+    if name == "resnet101":
+        from model.resnet101 import ResNet101ManifoldMixup
+        return ResNet101ManifoldMixup(
+            num_classes=num_classes,
+            pretrained=pretrained,
+            dropout=dropout,
+        )
+
     if name in ("densenet", "efficientnet"):
         raise NotImplementedError(
-            f"V3 only requires ResNet-50; '{name}' is for other teammates' Vs."
+            f"V3 only requires ResNet; '{name}' is for other teammates' Vs."
         )
 
     raise ValueError(
-        f"Unknown model name '{name}'. Supported: 'resnet50', 'densenet', 'efficientnet'."
+        f"Unknown model name '{name}'. Supported: 'resnet50', 'resnet101', 'densenet', 'efficientnet'."
     )
