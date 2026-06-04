@@ -1,0 +1,47 @@
+experiment_name: "v1_resnet101_seed42"
+model_name: "resnet101"
+num_classes: 7
+class_names: ["N", "D", "G", "C", "A", "H", "M"]
+
+data:
+  image_dir: "data/preprocessed_images"
+  csv_path: "data/full_df.csv"
+  split_path: "data/patient_split_7class_stratified_811.json"
+  split_train_key: "train_patients"
+  split_val_key: "val_patients"
+  split_test_key: "test_patients"
+  patient_id_col: "ID"
+  filename_col: "filename"
+  class_cols: ["N", "D", "G", "C", "A", "H", "M"]
+  img_size: 224
+
+train:
+  batch_size: 32
+  dropout: 0.5
+  device: "cuda"
+  num_workers: 4
+
+preprocessing:
+  clip_limit: 2.0
+  tile_grid_size: [8, 8]
+
+# 각 variant의 best.pth / thresholds.npy 경로
+variants:
+  V0:     "analysis/v0_resnet101_analysis"
+  V1_L:   "analysis/v1_L_resnet101_analysis"
+  V1_LA:  "analysis/v1_LA_resnet101_analysis"
+  V1_LB:  "analysis/v1_LB_resnet101_analysis"
+  V1_LAB: "analysis/v1_LAB_resnet101_analysis"
+
+# val AUC 기준 클래스별 best variant
+routing:
+  hard:
+    N: "V0"
+    D: "V1_LB"
+    G: "V1_L"
+    C: "V0"
+    A: "V1_LB"
+    H: "V1_LA"
+    M: "V1_LAB"
+
+output_dir: "analysis/v1_resnet101_analysis"
