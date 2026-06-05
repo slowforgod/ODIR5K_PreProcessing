@@ -61,4 +61,4 @@ losses:
   # kept for back-compat (unused when cb_weight_mode == "inverse_frequency")
   cb_beta: 0.9999
 
-output_dir: "analysis/v4_analysis"
+output_dir: "analysis/resnet50/v4_analysis"

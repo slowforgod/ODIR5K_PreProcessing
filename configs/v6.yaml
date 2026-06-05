@@ -64,4 +64,4 @@ losses:
   ral_neg_terms: 2
   cb_beta: 0.9999
   cb_weight_normalize: "mean_one"
-output_dir: "analysis/v6_analysis"
+output_dir: "analysis/resnet50/v6_analysis"

@@ -36,4 +36,4 @@ losses:
   cb_beta: 0.9999
   cb_weight_normalize: "mean_one"
 
-output_dir: "analysis/v3_analysis"
+output_dir: "analysis/resnet50/v3_analysis"

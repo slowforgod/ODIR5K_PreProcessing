@@ -31,4 +31,4 @@ preprocessing:
   clip_limit: 2.0
   tile_grid_size: [8, 8]
 
-output_dir: "analysis/v1_L_analysis"
+output_dir: "analysis/resnet50/v1_L_analysis"
