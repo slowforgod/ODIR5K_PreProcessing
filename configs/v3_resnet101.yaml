@@ -1,0 +1,39 @@
+experiment_name: "v3_resnet101_seed42"
+model_name: "resnet101"
+num_classes: 7
+class_names: ["N", "D", "G", "C", "A", "H", "M"]
+
+data:
+  image_dir: "data/preprocessed_images"
+  csv_path: "data/full_df.csv"
+  split_path: "data/patient_split_7class_stratified_811.json"
+  split_train_key: "train_patients"
+  split_val_key: "val_patients"
+  split_test_key: "test_patients"
+  patient_id_col: "ID"
+  filename_col: "filename"
+  class_cols: ["N", "D", "G", "C", "A", "H", "M"]
+  img_size: 224
+
+train:
+  batch_size: 32
+  num_epochs: 20
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  dropout: 0.5
+  patience: 8
+  seed: 42
+  device: "cuda"
+  num_workers: 4
+  use_amp: true
+
+preprocessing:
+  mixup_alpha: 0.2
+  mixup_layers: [1, 2, 3]
+
+losses:
+  loss_name: "cb_bce_with_logits_loss"
+  cb_beta: 0.9999
+  cb_weight_normalize: "mean_one"
+
+output_dir: "analysis/resnet101/v3_resnet101_analysis"
