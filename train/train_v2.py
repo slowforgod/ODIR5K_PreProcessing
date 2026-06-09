@@ -42,6 +42,8 @@ from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as T
 import yaml
 
+from preprocessing.common import crop_black_border as _crop_black_border
+
 warnings.filterwarnings("ignore")
 
 CLASS_NAMES = ["N", "D", "G", "C", "A", "H", "M"]
@@ -95,12 +97,14 @@ class ODIRV2Dataset(Dataset):
         is_train: bool = True,
         preprocessor=None,
         smoke_n: int = 0,
+        crop_black_border: bool = False,
     ):
         if smoke_n > 0:
             records = records[:smoke_n]
 
         self.is_train = is_train
         self.preprocessor = preprocessor
+        self.crop_black_border = crop_black_border
 
         self._val_transform = T.Compose([
             T.Resize((img_size, img_size)),
@@ -130,6 +134,12 @@ class ODIRV2Dataset(Dataset):
     def __getitem__(self, idx: int):
         img_path, label = self.samples[idx]
         img_pil = Image.open(img_path).convert("RGB")
+
+        # Optional black-border crop (off by default → ResNet V2 baseline unchanged).
+        # Used by EfficientNet V2 to maximise effective resolution at 300×300.
+        if self.crop_black_border:
+            cropped = _crop_black_border(np.array(img_pil, dtype=np.uint8))
+            img_pil = Image.fromarray(cropped)
 
         if self.is_train and self.preprocessor is not None:
             img_np = np.array(img_pil, dtype=np.uint8)
@@ -273,11 +283,15 @@ def train(cfg: dict, smoke: bool = False) -> None:
     }
     preprocessor = V2Preprocessor(img_size=img_size, **aug_kwargs)
 
+    crop_bb = bool(pre_cfg.get("crop_black_border", False))
+
     # ── Datasets + DataLoaders ───────────────────────────────────────────
     train_ds = ODIRV2Dataset(expanded_records, image_dir, img_size, is_train=True,
-                              preprocessor=preprocessor, smoke_n=smoke_train)
+                              preprocessor=preprocessor, smoke_n=smoke_train,
+                              crop_black_border=crop_bb)
     val_ds   = ODIRV2Dataset(val_records, image_dir, img_size, is_train=False,
-                              preprocessor=None, smoke_n=smoke_val)
+                              preprocessor=None, smoke_n=smoke_val,
+                              crop_black_border=crop_bb)
 
     print(f"Train samples (expanded): {len(train_ds)} | Val samples: {len(val_ds)}")
 
@@ -293,7 +307,8 @@ def train(cfg: dict, smoke: bool = False) -> None:
     test_loader = None
     if test_records is not None:
         test_ds = ODIRV2Dataset(test_records, image_dir, img_size, is_train=False,
-                                preprocessor=None, smoke_n=smoke_test)
+                                preprocessor=None, smoke_n=smoke_test,
+                                crop_black_border=crop_bb)
         test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
                                  num_workers=num_workers, pin_memory=(device.type == "cuda"))
         print(f"Test samples: {len(test_ds)}")
@@ -345,7 +360,7 @@ def train(cfg: dict, smoke: bool = False) -> None:
         with open(history_path, "w", newline="") as hf:
             csv.DictWriter(hf, fieldnames=history_fields).writeheader()
 
-        best_auc   = -1.0
+        best_f1    = -1.0
         no_improve = 0
         best_epoch = 0
         ckpt_path  = os.path.join(loss_dir, "best.pth")
@@ -371,14 +386,16 @@ def train(cfg: dict, smoke: bool = False) -> None:
             ).item())
 
             epoch_metrics = compute_metrics(val_labels, val_probs, log_thresholds, class_names)
-            val_auc   = epoch_metrics["macro_auc"]
+            val_auc   = epoch_metrics["macro_auc"]          # history.csv 기록용
             val_f1    = epoch_metrics["macro_f1"]
             val_kappa = epoch_metrics["kappa"]
+            val_sens  = float(np.mean(list(epoch_metrics["sensitivity"].values())))
+            val_spec  = float(np.mean(list(epoch_metrics["specificity"].values())))
             scheduler.step()
 
             print(f"  Epoch {epoch:03d}/{num_epochs} | loss={train_loss:.4f} | "
-                  f"val_loss={val_loss:.4f} | val_auc={val_auc:.4f} | "
-                  f"val_f1={val_f1:.4f} | val_kappa={val_kappa:.4f}")
+                  f"val_loss={val_loss:.4f} | val_f1={val_f1:.4f} | "
+                  f"val_kappa={val_kappa:.4f} | val_sens={val_sens:.4f} | val_spec={val_spec:.4f}")
 
             with open(history_path, "a", newline="") as hf:
                 writer = csv.DictWriter(hf, fieldnames=history_fields)
@@ -388,12 +405,12 @@ def train(cfg: dict, smoke: bool = False) -> None:
                     "val_macro_f1": round(val_f1, 6), "val_kappa": round(val_kappa, 6),
                 })
 
-            if not np.isnan(val_auc) and val_auc > best_auc:
-                best_auc = val_auc
+            if not np.isnan(val_f1) and val_f1 > best_f1:
+                best_f1 = val_f1
                 best_epoch = epoch
                 no_improve = 0
                 torch.save(model.state_dict(), ckpt_path)
-                print(f"    [saved] best.pth (val_auc={best_auc:.4f})")
+                print(f"    [saved] best.pth (val_f1={best_f1:.4f})")
             else:
                 no_improve += 1
                 if no_improve >= patience:
@@ -401,7 +418,7 @@ def train(cfg: dict, smoke: bool = False) -> None:
                     break
 
         # ── Post-training: val 평가 + threshold 최적화 ──────────────────
-        if best_auc >= 0 and os.path.isfile(ckpt_path):
+        if best_f1 >= 0 and os.path.isfile(ckpt_path):
             print(f"\n  [reload] Loading best.pth (epoch {best_epoch}) ...")
             model.load_state_dict(torch.load(ckpt_path, map_location=device))
 
@@ -422,8 +439,10 @@ def train(cfg: dict, smoke: bool = False) -> None:
                 "thresholds":    thresholds.tolist(),
                 "best_epoch":    best_epoch,
             }
-            print(f"  [val]  auc={val_result['macro_auc']:.4f}  "
-                  f"f1={val_result['macro_f1']:.4f}  kappa={val_result['kappa']:.4f}")
+            v_sens = float(np.mean(list(val_result["sensitivity"].values())))
+            v_spec = float(np.mean(list(val_result["specificity"].values())))
+            print(f"  [val]  f1={val_result['macro_f1']:.4f}  kappa={val_result['kappa']:.4f}  "
+                  f"sens={v_sens:.4f}  spec={v_spec:.4f}")
 
             # ★ test 평가 — val threshold 재사용 (재계산 금지)
             if test_loader is not None:
@@ -439,8 +458,10 @@ def train(cfg: dict, smoke: bool = False) -> None:
                     "sensitivity":   test_result["sensitivity"],
                     "specificity":   test_result["specificity"],
                 }
-                print(f"  [test] auc={test_result['macro_auc']:.4f}  "
-                      f"f1={test_result['macro_f1']:.4f}  kappa={test_result['kappa']:.4f}")
+                t_sens = float(np.mean(list(test_result["sensitivity"].values())))
+                t_spec = float(np.mean(list(test_result["specificity"].values())))
+                print(f"  [test] f1={test_result['macro_f1']:.4f}  kappa={test_result['kappa']:.4f}  "
+                      f"sens={t_sens:.4f}  spec={t_spec:.4f}")
         else:
             print(f"  [warn] No improvement recorded for {loss_name}.")
             all_val_results[loss_name] = {
@@ -477,12 +498,16 @@ def train(cfg: dict, smoke: bool = False) -> None:
     print(f"\n{'='*60}")
     print(f"All {len(loss_experiments)} losses complete.  Results → {json_path}")
     print("Summary (val):")
+    def _fmt(x):
+        return f"{x:.4f}" if isinstance(x, (int, float)) and x is not None else "N/A"
+    def _mean(d):
+        return float(np.mean(list(d.values()))) if isinstance(d, dict) and d else None
     for lname, lmet in all_val_results.items():
-        auc = lmet.get("macro_auc")
-        f1  = lmet.get("macro_f1")
-        k   = lmet.get("kappa")
-        print(f"  {lname:<30} AUC={auc:.4f if auc else 'N/A'}  "
-              f"F1={f1:.4f if f1 else 'N/A'}  Kappa={k:.4f if k else 'N/A'}")
+        f1   = lmet.get("macro_f1")
+        k    = lmet.get("kappa")
+        sens = _mean(lmet.get("sensitivity"))
+        spec = _mean(lmet.get("specificity"))
+        print(f"  {lname:<30} F1={_fmt(f1)}  Kappa={_fmt(k)}  Sens={_fmt(sens)}  Spec={_fmt(spec)}")
     print("Done.")
 
 

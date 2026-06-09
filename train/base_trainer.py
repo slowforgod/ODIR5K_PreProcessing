@@ -28,6 +28,7 @@ from PIL import Image
 
 from model.base import build_model
 from analysis.metrics import evaluate_with_tta, save_metrics
+from preprocessing.common import crop_black_border
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +119,11 @@ class ODIRDataset(Dataset):
         img_path = os.path.join(self.image_dir, row[self.filename_col])
         image = np.array(Image.open(img_path).convert("RGB"))
         label = row[self.class_cols].values.astype(np.float32)
+
+        # Order: crop_black_border → CLAHE → resize. Required for EfficientNet
+        # (img_size=300) and harmless for ResNet (img_size=224) since the
+        # preprocessed images are already roughly tight.
+        image = crop_black_border(image)
 
         if self.transform is not None:
             image, label = self.transform(image, label)

@@ -49,7 +49,7 @@
 - 구현은 `analysis/metrics.py`의 `evaluate_with_tta`를 사용
 
 ### Early Stopping
-- 기준: **Val Macro AUC**
+- 기준: **Val Macro f1**
 - `patience = 8`
 - best checkpoint와 best 임계값(아래) 저장
 

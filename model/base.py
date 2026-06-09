@@ -47,11 +47,19 @@ def build_model(
             dropout=dropout,
         )
 
-    if name in ("densenet", "efficientnet"):
+    if name in ("efficientnet", "efficientnet_b3"):
+        from model.efficientnet_b3 import EfficientNetB3InputMixup
+        return EfficientNetB3InputMixup(
+            num_classes=num_classes,
+            pretrained=pretrained,
+            dropout=dropout,
+        )
+
+    if name == "densenet":
         raise NotImplementedError(
             f"V3 only requires ResNet; '{name}' is for other teammates' Vs."
         )
 
     raise ValueError(
-        f"Unknown model name '{name}'. Supported: 'resnet50', 'resnet101', 'densenet', 'efficientnet'."
+        f"Unknown model name '{name}'. Supported: 'resnet50', 'resnet101', 'efficientnet', 'efficientnet_b3', 'densenet'."
     )

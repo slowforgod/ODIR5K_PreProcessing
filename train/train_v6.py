@@ -34,6 +34,8 @@ from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as T
 import yaml
 
+from preprocessing.common import crop_black_border
+
 warnings.filterwarnings("ignore")
 
 CLASS_NAMES = ["N", "D", "G", "C", "A", "H", "M"]
@@ -77,70 +79,109 @@ def _to_serializable(obj):
 # Datasets
 # ---------------------------------------------------------------------------
 
+class V1ClaheCache:
+    """Variant-scoped cache for (crop_black_border → V1 CLAHE → Resize) result.
+
+    Eliminates redundant V1 CLAHE computation across the 3 loss runs (and
+    all epochs) within a single variant. Keyed by filename, so LSE-expanded
+    records sharing a source image hit the same cache entry.
+    """
+    def __init__(self, image_dir, v1_preprocessor, img_size):
+        self.image_dir = image_dir
+        self.v1 = v1_preprocessor
+        self.img_size = img_size
+        self.store: Dict[str, np.ndarray] = {}
+
+    def get(self, filename: str, label) -> np.ndarray:
+        cached = self.store.get(filename)
+        if cached is not None:
+            return cached
+        img_path = os.path.join(self.image_dir, filename)
+        img_np = np.array(Image.open(img_path).convert("RGB"), dtype=np.uint8)
+        img_np = crop_black_border(img_np)
+        img_np, _ = self.v1.apply(img_np, label)
+        img_np = np.array(Image.fromarray(img_np).resize(
+            (self.img_size, self.img_size), Image.BILINEAR
+        ))
+        self.store[filename] = img_np
+        return img_np
+
+    def clear(self) -> None:
+        self.store.clear()
+
+
 class ODIRV6TrainDataset(Dataset):
-    def __init__(self, records, image_dir, img_size=224, preprocessor=None, smoke_n=0):
+    """Train dataset: cache(crop+V1+Resize) → V2 aug → ToTensor+Normalize.
+
+    V1 CLAHE is pulled from cache when available; V2 augmentation is still
+    re-rolled stochastically each access.
+    """
+    def __init__(self, records, image_dir, img_size=224, cache=None,
+                 v2_preprocessor=None, smoke_n=0):
         if smoke_n > 0:
             records = records[:smoke_n]
-        self.preprocessor = preprocessor
-        self._resize = T.Resize((img_size, img_size))
+        self.cache = cache
+        self.v2 = v2_preprocessor
+        self.image_dir = image_dir
+        self.img_size = img_size
         self._to_tensor_norm = T.Compose([
             T.ToTensor(), T.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
         ])
         self.samples = []
         missing = 0
         for rec in records:
-            img_path = os.path.join(image_dir, rec["filename"])
+            fname = rec["filename"]
+            img_path = os.path.join(image_dir, fname)
             if not os.path.isfile(img_path):
                 missing += 1
                 continue
-            self.samples.append((img_path, rec["labels"].copy()))
+            self.samples.append((fname, rec["labels"].copy()))
         if missing:
             print(f"  [warn] {missing} records skipped", file=sys.stderr)
 
     def __len__(self): return len(self.samples)
 
     def __getitem__(self, idx):
-        img_path, label = self.samples[idx]
-        img_pil = self._resize(Image.open(img_path).convert("RGB"))
-        img_np  = np.array(img_pil, dtype=np.uint8)
-        if self.preprocessor is not None:
-            img_np, _ = self.preprocessor.apply(img_np, label)
+        fname, label = self.samples[idx]
+        img_np = self.cache.get(fname, label)
+        if self.v2 is not None:
+            # V2's Resize is a no-op since cache is already (img_size, img_size).
+            img_np, _ = self.v2.apply(img_np, label)
         return self._to_tensor_norm(img_np), torch.tensor(label, dtype=torch.float32)
 
 
 class ODIRV6EvalDataset(Dataset):
-    """Val/Test dataset: V1 CLAHE only, no V2 augmentation."""
-    def __init__(self, records, image_dir, img_size=224, preprocessor=None, smoke_n=0):
+    """Val/Test dataset: cache(crop+V1+Resize) → ToTensor+Normalize.
+
+    No V2 augmentation. Shares the V1 CLAHE cache with the train dataset.
+    """
+    def __init__(self, records, image_dir, img_size=224, cache=None, smoke_n=0):
         if smoke_n > 0:
             records = records[:smoke_n]
-        self.preprocessor = preprocessor
-        self._resize = T.Resize((img_size, img_size))
+        self.cache = cache
+        self.image_dir = image_dir
+        self.img_size = img_size
         self._to_tensor_norm = T.Compose([
             T.ToTensor(), T.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
         ])
         self.samples = []
         missing = 0
         for rec in records:
-            img_path = os.path.join(image_dir, rec["filename"])
+            fname = rec["filename"]
+            img_path = os.path.join(image_dir, fname)
             if not os.path.isfile(img_path):
                 missing += 1
                 continue
-            self.samples.append((img_path, rec["labels"].copy()))
+            self.samples.append((fname, rec["labels"].copy()))
         if missing:
             print(f"  [warn] {missing} records skipped", file=sys.stderr)
 
     def __len__(self): return len(self.samples)
 
     def __getitem__(self, idx):
-        img_path, label = self.samples[idx]
-        img_pil = self._resize(Image.open(img_path).convert("RGB"))
-        if self.preprocessor is not None:
-            img_np = np.array(img_pil, dtype=np.uint8)
-            img_np, _ = self.preprocessor.apply(img_np, label)
-            img_tensor = self._to_tensor_norm(img_np)
-        else:
-            img_tensor = self._to_tensor_norm(img_pil)
-        return img_tensor, torch.tensor(label, dtype=torch.float32)
+        fname, label = self.samples[idx]
+        img_np = self.cache.get(fname, label)
+        return self._to_tensor_norm(img_np), torch.tensor(label, dtype=torch.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -202,9 +243,9 @@ def train(cfg: dict, smoke: bool = False) -> None:
     from model.base import build_model
     from preprocessing.v1.clahe import V1Preprocessor
     from preprocessing.v1.routing import DEFAULT_VARIANTS, soft_route_uniform
+    from preprocessing.v2.augmentation import V2Preprocessor
     from preprocessing.v2.oversampling import expand_with_lse
     from preprocessing.v2.losses import effective_number_class_weights, make_criterion
-    from preprocessing.v6.preprocess import V6Preprocessor
     from analysis.metrics import compute_metrics, evaluate_with_tta, find_optimal_thresholds
 
     # ── Seed + device ────────────────────────────────────────────────────
@@ -331,29 +372,45 @@ def train(cfg: dict, smoke: bool = False) -> None:
         per_variant_per_loss_val[variant]  = {}
         per_variant_per_loss_test[variant] = {}
 
-        v6_pre = V6Preprocessor(
-            v1_kwargs=dict(variant=variant, clip_limit=clip_limit, tile_grid_size=tile_grid),
-            v2_kwargs=dict(img_size=img_size, **aug_kwargs),
-        )
-        v1_val_pre = V1Preprocessor(variant=variant, clip_limit=clip_limit, tile_grid_size=tile_grid)
+        v1_pre = V1Preprocessor(variant=variant, clip_limit=clip_limit, tile_grid_size=tile_grid)
+        v2_pre = V2Preprocessor(img_size=img_size, **aug_kwargs)
+        # Shared V1 CLAHE cache for this variant: reused across train/val/test
+        # datasets and across all 3 loss runs × num_epochs.
+        clahe_cache = V1ClaheCache(image_dir, v1_pre, img_size)
 
-        train_ds = ODIRV6TrainDataset(expanded_records, image_dir, img_size, v6_pre, smoke_train)
-        val_ds   = ODIRV6EvalDataset(val_records, image_dir, img_size, v1_val_pre, smoke_val)
+        train_ds = ODIRV6TrainDataset(expanded_records, image_dir, img_size,
+                                      cache=clahe_cache, v2_preprocessor=v2_pre,
+                                      smoke_n=smoke_train)
+        val_ds   = ODIRV6EvalDataset(val_records, image_dir, img_size,
+                                     cache=clahe_cache, smoke_n=smoke_val)
         test_ds  = (
-            ODIRV6EvalDataset(test_records, image_dir, img_size, v1_val_pre, smoke_test)
+            ODIRV6EvalDataset(test_records, image_dir, img_size,
+                              cache=clahe_cache, smoke_n=smoke_test)
             if test_records is not None else None
         )
 
         print(f"  Train (expanded): {len(train_ds)}  Val: {len(val_ds)}"
               + (f"  Test: {len(test_ds)}" if test_ds else ""))
 
+        # persistent_workers keeps worker processes alive across epoch
+        # boundaries so each worker's V1 CLAHE cache survives between
+        # epochs AND between the 3 loss runs (loaders are variant-scoped).
+        # With num_workers=0 the cache lives in the main process and is
+        # trivially shared.
+        loader_persist = num_workers > 0
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                                  num_workers=num_workers, pin_memory=(device.type == "cuda"))
+                                  num_workers=num_workers,
+                                  persistent_workers=loader_persist,
+                                  pin_memory=(device.type == "cuda"))
         val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                                  num_workers=num_workers, pin_memory=(device.type == "cuda"))
+                                  num_workers=num_workers,
+                                  persistent_workers=loader_persist,
+                                  pin_memory=(device.type == "cuda"))
         test_loader  = (
             DataLoader(test_ds, batch_size=batch_size, shuffle=False,
-                       num_workers=num_workers, pin_memory=(device.type == "cuda"))
+                       num_workers=num_workers,
+                       persistent_workers=loader_persist,
+                       pin_memory=(device.type == "cuda"))
             if test_ds is not None else None
         )
 
@@ -380,7 +437,7 @@ def train(cfg: dict, smoke: bool = False) -> None:
             with open(history_path, "w", newline="") as hf:
                 csv.DictWriter(hf, fieldnames=history_fields).writeheader()
 
-            best_auc   = -1.0
+            best_f1    = -1.0
             no_improve = 0
             best_epoch = 0
             ckpt_path  = os.path.join(loss_dir, "best.pth")
@@ -417,7 +474,7 @@ def train(cfg: dict, smoke: bool = False) -> None:
                 scheduler.step()
 
                 print(f"    Epoch {epoch:03d}/{num_epochs} | loss={train_loss:.4f} | "
-                      f"val_loss={val_loss:.4f} | val_auc={val_auc:.4f} | val_f1={val_f1:.4f} | "
+                      f"val_loss={val_loss:.4f} | val_f1={val_f1:.4f} | "
                       f"val_kappa={val_kappa:.4f} | val_sens={val_sens:.4f} | val_spec={val_spec:.4f}")
 
                 with open(history_path, "a", newline="") as hf:
@@ -428,12 +485,12 @@ def train(cfg: dict, smoke: bool = False) -> None:
                         "val_macro_f1": round(val_f1, 6), "val_kappa": round(val_kappa, 6),
                     })
 
-                if not np.isnan(val_auc) and val_auc > best_auc:
-                    best_auc = val_auc
+                if not np.isnan(val_f1) and val_f1 > best_f1:
+                    best_f1 = val_f1
                     best_epoch = epoch
                     no_improve = 0
                     torch.save(model.state_dict(), ckpt_path)
-                    print(f"      [saved] best.pth (val_auc={best_auc:.4f})")
+                    print(f"      [saved] best.pth (val_f1={best_f1:.4f})")
                 else:
                     no_improve += 1
                     if no_improve >= patience:
@@ -441,7 +498,7 @@ def train(cfg: dict, smoke: bool = False) -> None:
                         break
 
             # ── Post-training: val 평가 + threshold 최적화 ──────────────
-            if best_auc >= 0 and os.path.isfile(ckpt_path):
+            if best_f1 >= 0 and os.path.isfile(ckpt_path):
                 print(f"\n    [reload] Loading best.pth (epoch {best_epoch}) ...")
                 model.load_state_dict(torch.load(ckpt_path, map_location=device))
 
@@ -500,6 +557,14 @@ def train(cfg: dict, smoke: bool = False) -> None:
             del model
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+
+        # ── End of variant: free V1 CLAHE cache + tear down loaders ─────
+        print(f"  [cache] V1 CLAHE cache hit {len(clahe_cache.store)} unique images "
+              f"for variant {variant}; clearing.")
+        clahe_cache.clear()
+        del train_loader, val_loader
+        if test_loader is not None:
+            del test_loader
 
     # ── Routing aggregation ──────────────────────────────────────────────
     print(f"\n{'='*60}")

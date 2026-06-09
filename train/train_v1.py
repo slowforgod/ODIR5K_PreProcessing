@@ -28,6 +28,8 @@ import yaml
 
 warnings.filterwarnings("ignore")
 
+from preprocessing.common import crop_black_border
+
 CLASS_NAMES = ["N", "D", "G", "C", "A", "H", "M"]
 _IMAGENET_MEAN = [0.485, 0.456, 0.406]
 _IMAGENET_STD  = [0.229, 0.224, 0.225]
@@ -91,7 +93,7 @@ class ODIRV1Dataset(Dataset):
         preprocessor=None,
     ):
         self.preprocessor = preprocessor
-        self._resize = T.Resize((img_size, img_size))
+        self.img_size = img_size
         self._to_tensor_norm = T.Compose([
             T.ToTensor(),
             T.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
@@ -115,16 +117,16 @@ class ODIRV1Dataset(Dataset):
 
     def __getitem__(self, idx: int):
         img_path, label = self.samples[idx]
-        img_pil = self._resize(Image.open(img_path).convert("RGB"))
+        img_np = np.array(Image.open(img_path).convert("RGB"), dtype=np.uint8)
+        img_np = crop_black_border(img_np)
 
         if self.preprocessor is not None:
-            img_np = np.array(img_pil, dtype=np.uint8)
             img_np, _ = self.preprocessor.apply(img_np, label)
-            img_tensor = self._to_tensor_norm(img_np)
-        else:
-            img_tensor = self._to_tensor_norm(img_pil)
 
-        return img_tensor, torch.tensor(label, dtype=torch.float32)
+        img_pil = Image.fromarray(img_np).resize(
+            (self.img_size, self.img_size), Image.BILINEAR
+        )
+        return self._to_tensor_norm(img_pil), torch.tensor(label, dtype=torch.float32)
 
 
 # ---------------------------------------------------------------------------
