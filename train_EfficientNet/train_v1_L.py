@@ -1,16 +1,16 @@
 """
-train/train_v1_LAB.py
+train/train_v1_L.py
 
-Entry point for V1 CLAHE L+A+B experiment.
+Entry point for V1 CLAHE L-only experiment.
 
 Usage:
-    python -m train.train_v1_LAB --config configs/v1_LAB.yaml
+    python -m train_EfficientNet.train_v1_L --config configs_EfficientNet/v1_L_efficientnet.yaml
 """
 
 import argparse
 import yaml
 
-from train.base_trainer import BaseTrainer
+from train_EfficientNet.base_trainer import BaseTrainer
 
 
 def load_yaml(path: str) -> dict:
@@ -18,20 +18,20 @@ def load_yaml(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-class V1LABTrainer(BaseTrainer):
-    """V1 — CLAHE on L, A, and B channels of LAB colour space."""
+class V1LTrainer(BaseTrainer):
+    """V1 — CLAHE on L channel only."""
 
     def _build_preprocessor(self, prep_cfg: dict):
-        from preprocessing.v1.clahe_LAB import V1LABPreprocessor
-        return V1LABPreprocessor(**prep_cfg)
+        from preprocessing.v1.clahe_L import V1LPreprocessor
+        return V1LPreprocessor(**prep_cfg)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train V1 CLAHE L+A+B")
+    parser = argparse.ArgumentParser(description="Train V1 CLAHE L")
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/v1_LAB.yaml",
+        default="configs_EfficientNet/v1_L_efficientnet.yaml",
         help="Path to config YAML file",
     )
     args = parser.parse_args()
@@ -40,7 +40,7 @@ def main():
     print(f"Loaded config: {args.config}")
     print(f"Experiment: {cfg['experiment_name']}\n")
 
-    trainer = V1LABTrainer(cfg)
+    trainer = V1LTrainer(cfg)
     trainer.fit()
     trainer.evaluate_and_save()
 

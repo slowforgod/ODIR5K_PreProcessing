@@ -374,8 +374,32 @@ def make_criterion(
             class_weight=cb_weights,
         )
 
+    if name == "db":
+        # Distribution-Balanced Loss. Needs per-class positive counts +
+        # total sample count from the ORIGINAL train split, passed via params.
+        from preprocessing.v2.db_loss import DistributionBalancedLoss
+        class_freq = params.get("db_class_freq")
+        num_samples = params.get("db_num_samples")
+        if class_freq is None or num_samples is None:
+            raise ValueError(
+                "make_criterion('db', ...) requires params['db_class_freq'] "
+                "(C,) and params['db_num_samples'] (int) from the original "
+                "train split."
+            )
+        if not torch.is_tensor(class_freq):
+            class_freq = torch.as_tensor(class_freq, dtype=torch.float32)
+        return DistributionBalancedLoss(
+            class_freq=class_freq,
+            num_samples=int(num_samples),
+            map_alpha=float(params.get("db_map_alpha", 0.1)),
+            map_beta=float(params.get("db_map_beta", 10.0)),
+            map_gamma=float(params.get("db_map_gamma", 0.2)),
+            neg_scale=float(params.get("db_neg_scale", 2.0)),
+            init_bias=float(params.get("db_init_bias", 0.05)),
+        )
+
     raise ValueError(
         f"Unknown loss name '{name}'. Valid names: "
         "bce_with_logits_loss, focal_loss, robust_asymmetric_loss, "
-        "cb_bce_with_logits_loss, cb_focal_loss."
+        "cb_bce_with_logits_loss, cb_focal_loss, db."
     )

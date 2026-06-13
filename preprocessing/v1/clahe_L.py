@@ -9,7 +9,7 @@ Algorithm:
        - L: brightness contrast enhancement
     3. LAB → RGB  (cv2.COLOR_LAB2RGB)
 
-Parameters (from configs/v1_L.yaml):
+Parameters (from configs_ResNet/v1_L.yaml):
     clip_limit     : CLAHE clip limit          (default 2.0)
     tile_grid_size : CLAHE tile grid size tuple (default (8, 8))
 """

@@ -31,7 +31,7 @@ train:
 
   # === Loss function ===
   # Focal Loss (logits) — 소수 클래스(A/H/M) Sens 강화 목적.
-  # 비교 대상: configs/v1.yaml (weighted_bce)
+  # 비교 대상: configs_ResNet/v1.yaml (weighted_bce)
   loss_type: "focal"
   focal_gamma: 2.0
   focal_use_pos_weight: true

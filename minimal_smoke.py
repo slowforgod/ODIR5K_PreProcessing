@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 def minimal_cfg(version):
-    with open(f'configs/v{version}.yaml') as f:
+    with open(f'configs_ResNet/v{version}.yaml') as f:
         cfg = yaml.safe_load(f)
     # Restrict to 1 variant and 1 loss
     cfg['preprocessing']['variants'] = ['V0']
@@ -22,7 +22,7 @@ def minimal_cfg(version):
     return cfg
 
 def run_v4_minimal():
-    from train.train_v4 import train
+    from train_ResNet.train_v4 import train
     cfg = minimal_cfg(4)
     train(cfg, smoke=True)
     # Check output
@@ -39,7 +39,7 @@ def run_v4_minimal():
     print("=== V4 MINIMAL SMOKE PASSED ===", flush=True)
 
 def run_v5_minimal():
-    from train.train_v5 import train
+    from train_ResNet.train_v5 import train
     cfg = minimal_cfg(5)
     train(cfg, smoke=True)
     json_path = os.path.join('analysis/v5_analysis', 'v5_resnet50_seed42.json')
@@ -51,7 +51,7 @@ def run_v5_minimal():
     print("=== V5 MINIMAL SMOKE PASSED ===", flush=True)
 
 def run_v6_minimal():
-    from train.train_v6 import train
+    from train_ResNet.train_v6 import train
     cfg = minimal_cfg(6)
     train(cfg, smoke=True)
     json_path = os.path.join('analysis/v6_analysis', 'v6_resnet50_seed42.json')

@@ -85,6 +85,56 @@ def soft_route_uniform(
     return stacked.mean(axis=0).astype(np.float32)
 
 
+def soft_route_weighted(
+    probs_by_variant: Dict[str, np.ndarray],
+    per_variant_class_weight: Dict[str, Dict[str, float]],
+    class_names: List[str],
+) -> np.ndarray:
+    """Per-class weighted average across variants.
+
+    Unlike `soft_route_uniform` (equal weights), each variant's contribution to
+    a given class column is weighted by a per-(variant, class) score — typically
+    that variant's validation macro/per-class AUC for the class. Weights are
+    normalised to sum to 1 within each class column, so a variant that is
+    stronger on a class pulls that column toward its prediction.
+
+    Args:
+        probs_by_variant         : dict variant → (N, C) probability matrix
+        per_variant_class_weight : dict variant → {class_name: weight}. A missing
+                                   variant or class falls back to weight 0.0; if
+                                   every weight in a column is 0 (or missing), the
+                                   column degrades gracefully to a uniform average.
+        class_names              : list of C class names (column order)
+
+    Returns:
+        (N, C) ndarray — per-class weighted mean across variants
+    """
+    if not probs_by_variant:
+        raise ValueError("soft_route_weighted: probs_by_variant is empty")
+
+    variants = list(probs_by_variant.keys())
+    n = next(iter(probs_by_variant.values())).shape[0]
+    c = len(class_names)
+    out = np.empty((n, c), dtype=np.float32)
+
+    for col, cls in enumerate(class_names):
+        weights = np.array(
+            [float(per_variant_class_weight.get(v, {}).get(cls, 0.0)) for v in variants],
+            dtype=np.float64,
+        )
+        wsum = weights.sum()
+        if wsum <= 0.0:
+            # No usable weights for this class → fall back to uniform average.
+            weights = np.ones(len(variants), dtype=np.float64)
+            wsum = weights.sum()
+        weights = weights / wsum
+
+        col_stack = np.stack([probs_by_variant[v][:, col] for v in variants], axis=0)  # (V, N)
+        out[:, col] = (weights[:, None] * col_stack).sum(axis=0).astype(np.float32)
+
+    return out
+
+
 def auto_route_from_val(
     probs_by_variant: Dict[str, np.ndarray],
     labels_val: np.ndarray,

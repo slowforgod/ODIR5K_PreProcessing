@@ -1,16 +1,16 @@
 """
-train/train_v1_LB.py
+train/train_v0.py
 
-Entry point for V1 CLAHE L+B experiment.
+Entry point for V0 baseline experiment.
 
 Usage:
-    python -m train.train_v1_LB --config configs/v1_LB.yaml
+    python -m train_ResNet.train_v0 --config configs_ResNet/v0.yaml
 """
 
 import argparse
 import yaml
 
-from train.base_trainer import BaseTrainer
+from train_ResNet.base_trainer import BaseTrainer
 
 
 def load_yaml(path: str) -> dict:
@@ -18,20 +18,20 @@ def load_yaml(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-class V1LBTrainer(BaseTrainer):
-    """V1 — CLAHE on L and B channels of LAB colour space."""
+class V0Trainer(BaseTrainer):
+    """V0 Baseline — identity preprocessor (no transform)."""
 
     def _build_preprocessor(self, prep_cfg: dict):
-        from preprocessing.v1.clahe_LB import V1LBPreprocessor
-        return V1LBPreprocessor(**prep_cfg)
+        from preprocessing.v0.preprocess import V0Preprocessor
+        return V0Preprocessor(**prep_cfg)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train V1 CLAHE L+B")
+    parser = argparse.ArgumentParser(description="Train V0 Baseline")
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/v1_LB.yaml",
+        default="configs_ResNet/v0.yaml",
         help="Path to config YAML file",
     )
     args = parser.parse_args()
@@ -40,7 +40,7 @@ def main():
     print(f"Loaded config: {args.config}")
     print(f"Experiment: {cfg['experiment_name']}\n")
 
-    trainer = V1LBTrainer(cfg)
+    trainer = V0Trainer(cfg)
     trainer.fit()
     trainer.evaluate_and_save()
 

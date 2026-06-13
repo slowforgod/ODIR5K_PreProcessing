@@ -4,13 +4,13 @@ train/train_v1_AB.py
 Entry point for V1 CLAHE A+B experiment.
 
 Usage:
-    python -m train.train_v1_AB --config configs/v1_AB.yaml
+    python -m train_ResNet.train_v1_AB --config configs_ResNet/v1_AB.yaml
 """
 
 import argparse
 import yaml
 
-from train.base_trainer import BaseTrainer
+from train_ResNet.base_trainer import BaseTrainer
 
 
 def load_yaml(path: str) -> dict:
@@ -31,7 +31,7 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/v1_AB.yaml",
+        default="configs_ResNet/v1_AB.yaml",
         help="Path to config YAML file",
     )
     args = parser.parse_args()

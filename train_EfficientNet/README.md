@@ -112,7 +112,7 @@ def main(args):
 ## 실행
 
 ```bash
-python -m train.train_v1 --config configs/v1.yaml
+python -m train_EfficientNet.train_v1 --config configs_EfficientNet/v1_efficientnet.yaml
 ```
 
 모든 V에 동일한 패턴.

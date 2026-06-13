@@ -1,20 +1,17 @@
 """
-train/train_v5.py
+train/train_v4.py
 
-Entry point for V5: V1 soft routing × Manifold Mixup (V3) × 1 loss (cb_bce_with_logits_loss).
-
-No LSE / V2 augmentation. V1 CLAHE applied to both train and val.
-WeightedRandomSampler (V3 pattern) used instead of LSE.
-Model: ResNet50ManifoldMixup (build_model("resnet50")).
-Optimizer: AdamW (V5 default, same as V3).
+Entry point for V4: V1 soft routing × V2 (LSE + Augmentation) × 1 loss (cb_bce_with_logits_loss).
 
 Outer loop: 4 CLAHE variants (V1_L, V1_LA, V1_LB, V1_LAB)
 Inner loop: 1 loss function (cb_bce_with_logits_loss)
-Total: 4 training runs.
+
+Total: 4 variants × 1 loss = 4 training runs.
+After all runs, soft_route_uniform is applied across 4 variant probs.
 
 Usage:
-    python -m train.train_v5 --config configs/v5.yaml
-    python -m train.train_v5 --config configs/v5.yaml --smoke
+    python -m train_ResNet.train_v4 --config configs_ResNet/v4.yaml
+    python -m train_ResNet.train_v4 --config configs_ResNet/v4.yaml --smoke
 
 변경 이력:
   - test split 로드 + test_loader 구성
@@ -37,7 +34,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as T
 import yaml
 
@@ -82,13 +79,13 @@ def _to_serializable(obj):
 
 
 # ---------------------------------------------------------------------------
-# Dataset
+# Datasets
 # ---------------------------------------------------------------------------
 
-class ODIRV5Dataset(Dataset):
-    def __init__(self, df, image_dir, class_cols, img_size=224, preprocessor=None, smoke_n=0):
+class ODIRV4TrainDataset(Dataset):
+    def __init__(self, records, image_dir, img_size=224, preprocessor=None, smoke_n=0):
         if smoke_n > 0:
-            df = df.head(smoke_n)
+            records = records[:smoke_n]
         self.preprocessor = preprocessor
         self._resize = T.Resize((img_size, img_size))
         self._to_tensor_norm = T.Compose([
@@ -97,15 +94,48 @@ class ODIRV5Dataset(Dataset):
         ])
         self.samples = []
         missing = 0
-        for _, row in df.iterrows():
-            img_path = os.path.join(image_dir, str(row["filename"]))
+        for rec in records:
+            img_path = os.path.join(image_dir, rec["filename"])
             if not os.path.isfile(img_path):
                 missing += 1
                 continue
-            label = row[class_cols].values.astype(np.float32)
-            self.samples.append((img_path, label))
+            self.samples.append((img_path, rec["labels"].copy()))
         if missing:
-            print(f"  [warn] {missing} rows skipped", file=sys.stderr)
+            print(f"  [warn] {missing} records skipped", file=sys.stderr)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+        img_pil = self._resize(Image.open(img_path).convert("RGB"))
+        img_np = np.array(img_pil, dtype=np.uint8)
+        if self.preprocessor is not None:
+            img_np, _ = self.preprocessor.apply(img_np, label)
+        return self._to_tensor_norm(img_np), torch.tensor(label, dtype=torch.float32)
+
+
+class ODIRV4EvalDataset(Dataset):
+    """Val/Test dataset: V1 CLAHE only, no V2 augmentation."""
+    def __init__(self, records, image_dir, img_size=224, preprocessor=None, smoke_n=0):
+        if smoke_n > 0:
+            records = records[:smoke_n]
+        self.preprocessor = preprocessor
+        self._resize = T.Resize((img_size, img_size))
+        self._to_tensor_norm = T.Compose([
+            T.ToTensor(),
+            T.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
+        ])
+        self.samples = []
+        missing = 0
+        for rec in records:
+            img_path = os.path.join(image_dir, rec["filename"])
+            if not os.path.isfile(img_path):
+                missing += 1
+                continue
+            self.samples.append((img_path, rec["labels"].copy()))
+        if missing:
+            print(f"  [warn] {missing} records skipped", file=sys.stderr)
 
     def __len__(self):
         return len(self.samples)
@@ -123,45 +153,27 @@ class ODIRV5Dataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# DataLoader helper
+# Training loop
 # ---------------------------------------------------------------------------
 
-def make_weighted_sampler(dataset: ODIRV5Dataset) -> WeightedRandomSampler:
-    labels = np.stack([s[1] for s in dataset.samples])
-    class_freq = labels.sum(axis=0).clip(min=1.0)
-    class_inv  = 1.0 / class_freq
-    sample_weights = torch.tensor(
-        (labels * class_inv).sum(axis=1), dtype=torch.float32
-    )
-    return WeightedRandomSampler(
-        sample_weights, num_samples=len(sample_weights), replacement=True
-    )
-
-
-# ---------------------------------------------------------------------------
-# Training loop — Manifold Mixup
-# ---------------------------------------------------------------------------
-
-def train_one_epoch(model, loader, optimizer, criterion, device, alpha, mixup_layers, scaler=None):
+def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None):
     model.train()
     total_loss = 0.0
     use_amp = scaler is not None
     for imgs, labels in loader:
-        imgs   = imgs.to(device, non_blocking=True)
+        imgs = imgs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         optimizer.zero_grad()
         if use_amp:
             with torch.amp.autocast(device_type="cuda"):
-                out = model(imgs, y=labels, alpha=alpha, mixup_layers=mixup_layers)
-                logits, label_a, label_b, lam = out
-                loss = lam * criterion(logits, label_a) + (1.0 - lam) * criterion(logits, label_b)
+                logits = model(imgs)
+                loss = criterion(logits, labels)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
-            out = model(imgs, y=labels, alpha=alpha, mixup_layers=mixup_layers)
-            logits, label_a, label_b, lam = out
-            loss = lam * criterion(logits, label_a) + (1.0 - lam) * criterion(logits, label_b)
+            logits = model(imgs)
+            loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
         total_loss += loss.item()
@@ -177,8 +189,10 @@ def train(cfg: dict, smoke: bool = False) -> None:
     from model.base import build_model
     from preprocessing.v1.clahe import V1Preprocessor
     from preprocessing.v1.routing import DEFAULT_VARIANTS, soft_route_uniform
+    from preprocessing.v2.augmentation import V2Preprocessor
+    from preprocessing.v2.oversampling import expand_with_lse
     from preprocessing.v2.losses import effective_number_class_weights, make_criterion
-    from preprocessing.v5.preprocess import V5Preprocessor
+    from preprocessing.v4.preprocess import V4Preprocessor
     from analysis.metrics import compute_metrics, evaluate_with_tta, find_optimal_thresholds
 
     # ── Seed + device ────────────────────────────────────────────────────
@@ -222,7 +236,7 @@ def train(cfg: dict, smoke: bool = False) -> None:
     print(f"Train: {len(train_df)} / Val: {len(val_df)}"
           + (f" / Test: {len(test_df)}" if test_df is not None else ""))
 
-    # ── CB weights ───────────────────────────────────────────────────────
+    # ── CB weights (pre-LSE) ─────────────────────────────────────────────
     labels_ref_np = train_df[class_cols].values.astype(np.float32)
     cb_beta       = float(cfg.get("losses", {}).get("cb_beta", 0.9999))
     cb_normalize  = cfg.get("losses", {}).get("cb_weight_normalize", "mean_one")
@@ -234,17 +248,47 @@ def train(cfg: dict, smoke: bool = False) -> None:
     for i, c in enumerate(class_cols):
         print(f"  {c}: w={cb_weights[i]:.4f}")
 
-    # ── Config ───────────────────────────────────────────────────────────
+    # ── LSE expansion ────────────────────────────────────────────────────
+    pre_cfg      = cfg.get("preprocessing", {})
+    target_count = int(pre_cfg.get("lse_custom_target_count", 850))
+    max_aug      = int(pre_cfg.get("lse_max_aug_per_source", 12))
+
+    expanded_records = expand_with_lse(
+        train_df, class_cols=class_cols,
+        target_count=target_count, max_aug_per_source=max_aug, seed=seed,
+    )
+
+    def _df_to_records(df):
+        return [
+            {"filename": str(row["filename"]),
+             "labels": row[class_cols].values.astype(np.float32),
+             "aug_idx": 0}
+            for _, row in df.iterrows()
+        ]
+
+    val_records  = _df_to_records(val_df)
+    test_records = _df_to_records(test_df) if test_df is not None else None
+
     smoke_train = 200 if smoke else 0
     smoke_val   = 50  if smoke else 0
     smoke_test  = 50  if smoke else 0
 
-    pre_cfg      = cfg.get("preprocessing", {})
-    variants     = pre_cfg.get("variants", DEFAULT_VARIANTS)
-    clip_limit   = float(pre_cfg.get("clip_limit", 2.0))
-    tile_grid    = tuple(pre_cfg.get("tile_grid_size", [8, 8]))
-    alpha        = float(pre_cfg.get("mixup_alpha", 0.2))
-    mixup_layers = list(pre_cfg.get("mixup_layers", [1, 2, 3]))
+    # ── Config ───────────────────────────────────────────────────────────
+    variants    = pre_cfg.get("variants", DEFAULT_VARIANTS)
+    clip_limit  = float(pre_cfg.get("clip_limit", 2.0))
+    tile_grid   = tuple(pre_cfg.get("tile_grid_size", [8, 8]))
+
+    aug_kwargs = {
+        k: pre_cfg[k]
+        for k in (
+            "hflip_p", "vflip_p", "geo_p",
+            "rotate_limit", "affine_scale", "affine_translate",
+            "affine_rotate", "affine_shear", "crop_scale",
+            "color_jitter_p", "brightness", "contrast", "saturation",
+            "blur_p", "blur_limit",
+        )
+        if k in pre_cfg
+    }
 
     train_cfg    = cfg["train"]
     batch_size   = int(train_cfg.get("batch_size", 32))
@@ -258,8 +302,8 @@ def train(cfg: dict, smoke: bool = False) -> None:
     loss_experiments = cfg.get("losses", {}).get("experiments", ["cb_bce_with_logits_loss"])
     loss_params      = {k: cfg.get("losses", {}).get(k) for k in cfg.get("losses", {})}
 
-    output_base = cfg.get("output_dir", "analysis/v5_analysis")
-    exp_name    = cfg.get("experiment_name", "v5_resnet50_seed42")
+    output_base = cfg.get("output_dir", "analysis/v4_analysis")
+    exp_name    = cfg.get("experiment_name", "v4_resnet50_seed42")
     os.makedirs(output_base, exist_ok=True)
 
     log_thresholds = np.full(num_classes, 0.5, dtype=np.float32)
@@ -280,22 +324,23 @@ def train(cfg: dict, smoke: bool = False) -> None:
         per_variant_per_loss_val[variant]  = {}
         per_variant_per_loss_test[variant] = {}
 
-        v5_pre = V5Preprocessor(
-            v1_kwargs=dict(variant=variant, clip_limit=clip_limit, tile_grid_size=tile_grid)
+        v1_pre = V1Preprocessor(variant=variant, clip_limit=clip_limit, tile_grid_size=tile_grid)
+        v4_pre = V4Preprocessor(
+            v1_kwargs=dict(variant=variant, clip_limit=clip_limit, tile_grid_size=tile_grid),
+            v2_kwargs=dict(img_size=img_size, **aug_kwargs),
         )
 
-        train_ds = ODIRV5Dataset(train_df, image_dir, class_cols, img_size, v5_pre, smoke_train)
-        val_ds   = ODIRV5Dataset(val_df,   image_dir, class_cols, img_size, v5_pre, smoke_val)
+        train_ds = ODIRV4TrainDataset(expanded_records, image_dir, img_size, v4_pre, smoke_train)
+        val_ds   = ODIRV4EvalDataset(val_records, image_dir, img_size, v1_pre, smoke_val)
         test_ds  = (
-            ODIRV5Dataset(test_df, image_dir, class_cols, img_size, v5_pre, smoke_test)
-            if test_df is not None else None
+            ODIRV4EvalDataset(test_records, image_dir, img_size, v1_pre, smoke_test)
+            if test_records is not None else None
         )
 
-        print(f"  Train: {len(train_ds)}  Val: {len(val_ds)}"
+        print(f"  Train (expanded): {len(train_ds)}  Val: {len(val_ds)}"
               + (f"  Test: {len(test_ds)}" if test_ds else ""))
 
-        sampler = make_weighted_sampler(train_ds)
-        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler,
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                                   num_workers=num_workers, pin_memory=(device.type == "cuda"))
         val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                                   num_workers=num_workers, pin_memory=(device.type == "cuda"))
@@ -319,7 +364,7 @@ def train(cfg: dict, smoke: bool = False) -> None:
             ).to(device)
 
             criterion = make_criterion(loss_name, cb_weights=cb_weights, params=loss_params).to(device)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
             scaler    = torch.amp.GradScaler("cuda") if use_amp else None
 
@@ -334,10 +379,7 @@ def train(cfg: dict, smoke: bool = False) -> None:
             ckpt_path  = os.path.join(loss_dir, "best.pth")
 
             for epoch in range(1, num_epochs + 1):
-                train_loss = train_one_epoch(
-                    model, train_loader, optimizer, criterion,
-                    device, alpha, mixup_layers, scaler
-                )
+                train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, scaler)
 
                 model.eval()
                 all_probs_list, all_labels_list = [], []
@@ -433,8 +475,8 @@ def train(cfg: dict, smoke: bool = False) -> None:
                           f"f1={test_result['macro_f1']:.4f}  kappa={test_result['kappa']:.4f}")
             else:
                 print(f"    [warn] No improvement for {variant}/{loss_name}.")
-                probs_val_by_loss_by_variant[loss_name][variant] = np.zeros((len(val_ds), num_classes), dtype=np.float32)
-                per_variant_per_loss_val[variant][loss_name] = {
+                probs_val_by_loss_by_variant[loss_name][variant]  = np.zeros((len(val_ds), num_classes), dtype=np.float32)
+                per_variant_per_loss_val[variant][loss_name]  = {
                     "macro_auc": None, "per_class_auc": {}, "macro_f1": None,
                     "kappa": None, "sensitivity": {}, "specificity": {},
                     "thresholds": [], "best_epoch": 0,
@@ -459,6 +501,7 @@ def train(cfg: dict, smoke: bool = False) -> None:
     test_routing_metrics: Dict[str, dict] = {}
 
     for loss_name in loss_experiments:
+        # val soft routing
         prob_soft_val = soft_route_uniform(probs_val_by_loss_by_variant[loss_name], class_names)
         thr_soft      = find_optimal_thresholds(prob_soft_val, val_labels_shared, num_classes)
         met_soft_val  = compute_metrics(val_labels_shared, prob_soft_val, thr_soft, class_names)
@@ -467,6 +510,7 @@ def train(cfg: dict, smoke: bool = False) -> None:
         }
         print(f"  [val]  {loss_name:<30} soft_auc={met_soft_val['macro_auc']:.4f}  f1={met_soft_val['macro_f1']:.4f}")
 
+        # test soft routing — val threshold 재사용
         if test_labels_shared is not None:
             prob_soft_test = soft_route_uniform(probs_test_by_loss_by_variant[loss_name], class_names)
             met_soft_test  = compute_metrics(test_labels_shared, prob_soft_test, thr_soft, class_names)
@@ -502,7 +546,7 @@ def train(cfg: dict, smoke: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train V5: V1 × Manifold Mixup × cb_bce_with_logits_loss")
+    parser = argparse.ArgumentParser(description="Train V4: V1 × V2 × cb_bce_with_logits_loss")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
     parser.add_argument("--smoke", action="store_true",
                         help="Quick smoke test: 200 train / 50 val, 2 epochs per run")

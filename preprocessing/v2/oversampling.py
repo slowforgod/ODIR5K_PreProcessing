@@ -29,15 +29,22 @@ def expand_with_lse(
     target_count: int,
     max_aug_per_source: int,
     seed: int,
+    per_class_target: dict = None,
+    per_class_max_aug: dict = None,
 ) -> List[dict]:
     """Expand the training set using greedy per-class LSE oversampling.
 
     Args:
         train_df           : original training DataFrame (pre-expansion)
         class_cols         : list of 7 class column names (e.g. ['N','D','G','C','A','H','M'])
-        target_count       : desired positive count per class after expansion
-        max_aug_per_source : per-source-row cap on augmented copies
+        target_count       : default desired positive count per class after expansion
+        max_aug_per_source : default per-source-row cap on augmented copies
         seed               : RNG seed for deterministic shuffling
+        per_class_target   : optional {class_name: int} overriding target_count for
+                             specific classes (e.g. {"H": 1100}). Classes absent from
+                             the dict fall back to the scalar target_count.
+        per_class_max_aug  : optional {class_name: int} overriding max_aug_per_source
+                             for specific classes (e.g. {"H": 18}).
 
     Returns:
         List of record dicts:
@@ -51,6 +58,16 @@ def expand_with_lse(
     filenames = train_df["filename"].values
     num_classes = len(class_cols)
     n_orig = len(train_df)
+
+    per_class_target = per_class_target or {}
+    per_class_max_aug = per_class_max_aug or {}
+    # Per-class resolved targets / caps (fall back to scalar defaults)
+    targets = np.array(
+        [int(per_class_target.get(c, target_count)) for c in class_cols], dtype=int
+    )
+    max_augs = np.array(
+        [int(per_class_max_aug.get(c, max_aug_per_source)) for c in class_cols], dtype=int
+    )
 
     # ------------------------------------------------------------------ #
     # Build initial records from the original rows                        #
@@ -74,13 +91,18 @@ def expand_with_lse(
     # Greedy per-class expansion                                          #
     # ------------------------------------------------------------------ #
     print("\n[LSE] Oversampling summary:")
-    print(f"  target_count={target_count}  max_aug_per_source={max_aug_per_source}")
+    print(f"  default target_count={target_count}  default max_aug_per_source={max_aug_per_source}")
+    if per_class_target or per_class_max_aug:
+        print(f"  per-class target overrides : {per_class_target}")
+        print(f"  per-class max_aug overrides: {per_class_max_aug}")
     print(f"  Before expansion: total rows = {n_orig}")
     for ci, cls in enumerate(class_cols):
-        print(f"    {cls}: {int(pos_counts[ci])}")
+        print(f"    {cls}: {int(pos_counts[ci])}  (target={targets[ci]}, max_aug={max_augs[ci]})")
 
     for ci, cls in enumerate(class_cols):
-        if pos_counts[ci] >= target_count:
+        cls_target  = int(targets[ci])
+        cls_max_aug = int(max_augs[ci])
+        if pos_counts[ci] >= cls_target:
             continue  # already at or above target — skip
 
         # Source rows: original indices where class ci is positive
@@ -91,19 +113,19 @@ def expand_with_lse(
         # Shuffle sources for this class
         rng.shuffle(source_indices)
 
-        needed = target_count - pos_counts[ci]
+        needed = cls_target - pos_counts[ci]
         added = 0
         cycle_pos = 0
 
         while added < needed:
             # Check if any source still has capacity
-            if all(aug_copy_count[i] >= max_aug_per_source for i in source_indices):
+            if all(aug_copy_count[i] >= cls_max_aug for i in source_indices):
                 break  # all sources capped — cannot reach target
 
             src_idx = source_indices[cycle_pos % len(source_indices)]
             cycle_pos += 1
 
-            if aug_copy_count[src_idx] >= max_aug_per_source:
+            if aug_copy_count[src_idx] >= cls_max_aug:
                 continue
 
             # Add one augmented copy of this source row

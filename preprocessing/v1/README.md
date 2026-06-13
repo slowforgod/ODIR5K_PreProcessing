@@ -38,7 +38,7 @@ LAB → RGB (cv2.COLOR_LAB2RGB)
 - CLAHE 객체(`cv2.createCLAHE`)는 `__init__`에서 **한 번만** 생성하고 `apply()` 호출 시 재사용 (per-image 생성 금지 — 효율성)
 - A·B 채널 CLAHE는 색 대비를 강화해 혈관·출혈 영역의 경계를 뚜렷하게 만들 수 있으나, 과도하면 색 왜곡 위험이 있어 실험으로 검증
 
-### CLAHE 파라미터 (configs/v1.yaml)
+### CLAHE 파라미터 (configs_ResNet/v1.yaml)
 
 | 파라미터 | 값 | 설명 |
 |---------|-----|------|
@@ -84,7 +84,7 @@ class V1Preprocessor:
 
 5가지 Variant를 각각 **독립적인 ResNet-50**으로 순차 학습한다. 라벨이 동일하므로 `WeightedRandomSampler` 가중치와 `pos_weight`는 첫 번째 Variant 학습 시 **한 번만 계산**하고 이후 재사용한다.
 
-| 항목 | 값 (configs/v1.yaml) |
+| 항목 | 값 (configs_ResNet/v1.yaml) |
 |------|----------------------|
 | 모델 | ResNet-50, ImageNet pretrained, dropout=0.5 |
 | 옵티마이저 | Adam (lr=1e-4, weight_decay=1e-4) |
@@ -109,7 +109,7 @@ class V1Preprocessor:
 out[:, col] = probs_by_variant[routing_map[cls]][:, col]
 ```
 
-기본 라우팅 맵 (`DEFAULT_HARD_ROUTING`, configs/v1.yaml의 `routing.hard`에서 오버라이드 가능):
+기본 라우팅 맵 (`DEFAULT_HARD_ROUTING`, configs_ResNet/v1.yaml의 `routing.hard`에서 오버라이드 가능):
 
 | 클래스 | 배정 Variant | 배정 근거 |
 |--------|-------------|-----------|

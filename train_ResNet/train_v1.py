@@ -8,7 +8,7 @@ soft routing (uniform average) + hard routing 앙상블 후 결과 JSON 저장.
 훈련은 각각 train_v0 / train_v1_L / train_v1_LA / train_v1_LB / train_v1_LAB 로 진행.
 
 Usage:
-    python -m train.train_v1 --config configs/v1.yaml
+    python -m train_ResNet.train_v1 --config configs_ResNet/v1.yaml
 """
 
 import argparse

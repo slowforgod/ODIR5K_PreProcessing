@@ -45,7 +45,7 @@ class V6Preprocessor(BasePreprocessor):
 
 ## config
 
-`configs/v6.yaml`:
+`configs_ResNet/v6.yaml`:
 - `preprocessing.v1`: clip_limit, tile_grid_size
 - `preprocessing.v2`: augmentation 확률들
 - `preprocessing.v3`: mixup_alpha, mixup_layers

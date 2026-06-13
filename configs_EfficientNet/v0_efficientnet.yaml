@@ -1,0 +1,32 @@
+experiment_name: "v0_efficientnet_seed42"
+model_name: "efficientnet"
+num_classes: 7
+class_names: ["N", "D", "G", "C", "A", "H", "M"]
+
+data:
+  image_dir: "data/preprocessed_images"
+  csv_path: "data/full_df.csv"
+  split_path: "data/patient_split_7class_stratified_811.json"   # 변경: 8:1:1
+  split_train_key: "train_patients"
+  split_val_key: "val_patients"
+  split_test_key: "test_patients"                                # 추가
+  patient_id_col: "ID"
+  filename_col: "filename"
+  class_cols: ["N", "D", "G", "C", "A", "H", "M"]
+  img_size: 300
+
+train:
+  batch_size: 32
+  num_epochs: 30
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  dropout: 0.4
+  patience: 8
+  seed: 42
+  device: "cuda"
+  num_workers: 4
+  use_amp: true
+
+preprocessing: {}
+
+output_dir: "analysis/EfficientNet/v0_analysis"

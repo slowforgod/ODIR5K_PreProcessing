@@ -12,7 +12,7 @@ Algorithm:
     4. Merge channels back
     5. LAB → RGB  (cv2.COLOR_LAB2RGB)
 
-Parameters (from configs/v1_LA.yaml):
+Parameters (from configs_ResNet/v1_LA.yaml):
     clip_limit     : CLAHE clip limit          (default 2.0)
     tile_grid_size : CLAHE tile grid size tuple (default (8, 8))
 """

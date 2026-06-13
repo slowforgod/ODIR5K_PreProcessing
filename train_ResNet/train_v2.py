@@ -13,8 +13,8 @@ Runs 5 loss functions sequentially on the same data/model configuration:
 Each loss gets a fresh ImageNet-pretrained ResNet-50 and its own output subfolder.
 
 Usage:
-    python -m train.train_v2 --config configs/v2.yaml
-    python -m train.train_v2 --config configs/v2.yaml --smoke
+    python -m train_ResNet.train_v2 --config configs_ResNet/v2.yaml
+    python -m train_ResNet.train_v2 --config configs_ResNet/v2.yaml --smoke
 
 변경 이력:
   - split JSON: patient_split_7class_stratified.json (8:2)

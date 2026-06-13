@@ -1,4 +1,4 @@
-# configs/
+# configs_EfficientNet/
 
 V별 YAML 설정 파일.
 

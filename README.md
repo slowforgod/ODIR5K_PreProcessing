@@ -53,10 +53,12 @@ odir5k-project/
 ├── preprocessing/           # V0~V6 전처리 모듈
 │   ├── v0/ ... v6/
 ├── model/                   # 백본 팩토리 (ResNet50/DenseNet/EfficientNet)
-├── train/                   # 학습 엔트리 포인트 (V별)
+├── train_ResNet/            # ResNet 학습 엔트리 포인트 (V별)
+├── train_EfficientNet/      # EfficientNet 학습 엔트리 포인트 (사용 V만)
 ├── analysis/                # 평가 지표, 결과 JSON, 집계
 │   ├── v0_analysis/ ... v6_analysis/
-├── configs/                 # V별 YAML 설정
+├── configs_ResNet/          # ResNet V별 YAML 설정
+├── configs_EfficientNet/    # EfficientNet V별 YAML 설정
 ├── notebooks/               # Colab 러너 등
 ├── requirements.txt
 └── README.md
@@ -75,11 +77,15 @@ pip install -r requirements.txt
 ### 학교 서버 (CUDA)
 
 ```bash
-# 예: V1 실험
-python -m train.train_v1 --config configs/v1.yaml
+# 예: V1 ResNet 실험
+python -m train_ResNet.train_v1 --config configs_ResNet/v1.yaml
+
+# 예: V1 EfficientNet 실험
+python -m train_EfficientNet.train_v1 --config configs_EfficientNet/v1_efficientnet.yaml
 ```
 
-V0 ~ V6 각각에 대해 `train_v{N}.py` 엔트리 포인트를 사용한다.
+V0 ~ V6(+V7) 각각에 대해 `train_v{N}.py` 엔트리 포인트를 사용한다. 모델별로
+폴더가 분리돼 있어 사용 백본에 맞는 폴더의 엔트리 + config를 매칭해서 실행.
 
 ### Google Colab
 
@@ -88,7 +94,7 @@ V0 ~ V6 각각에 대해 `train_v{N}.py` 엔트리 포인트를 사용한다.
 1. 레포 클론
 2. `pip install -r requirements.txt`
 3. Google Drive 마운트 → `data/`를 Drive 데이터로 심볼릭 링크
-4. `!python -m train.train_v1 --config configs/v1.yaml`
+4. `!python -m train_ResNet.train_v1 --config configs_ResNet/v1.yaml`
 5. `analysis/v{N}_analysis/*.json`을 Drive로 복사
 
 ## 팀원별 담당

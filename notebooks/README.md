@@ -36,7 +36,7 @@ drive.mount('/content/drive')
 ### 4. 학습 실행
 
 ```python
-!python -m train.train_v1 --config configs/v1.yaml
+!python -m train_ResNet.train_v1 --config configs_ResNet/v1.yaml
 ```
 
 V를 바꾸려면 `train_v{N}` 과 `configs/v{N}.yaml`을 함께 바꾼다.
@@ -52,7 +52,7 @@ shutil.copytree('analysis/v1_analysis',
 
 ## 학교 서버 vs Colab
 
-- 학교 서버: 그대로 `python -m train.train_v1 --config configs/v1.yaml`
+- 학교 서버: 그대로 `python -m train_ResNet.train_v1 --config configs_ResNet/v1.yaml`
 - Colab: 위 셀 구성 그대로
 - 동일 코드·동일 config로 동일 결과가 나와야 함 (시드 고정)
 

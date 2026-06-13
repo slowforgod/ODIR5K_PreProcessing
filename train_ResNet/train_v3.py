@@ -4,8 +4,8 @@ train/train_v3.py
 Entry point for V3 (Manifold Mixup) training.
 
 Usage:
-    python -m train.train_v3 --config configs/v3.yaml
-    python -m train.train_v3 --config configs/v3.yaml --smoke
+    python -m train_ResNet.train_v3 --config configs_ResNet/v3.yaml
+    python -m train_ResNet.train_v3 --config configs_ResNet/v3.yaml --smoke
 
 변경 이력:
   - split JSON: patient_split_7class_stratified.json (8:2)

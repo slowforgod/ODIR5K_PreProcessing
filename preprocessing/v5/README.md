@@ -36,6 +36,6 @@ class V5Preprocessor(BasePreprocessor):
 
 ## config
 
-`configs/v5.yaml`에는:
+`configs_ResNet/v5.yaml`에는:
 - `preprocessing:` 아래 V1 파라미터 (`clip_limit`, `tile_grid_size`)
 - 별도로 V3 파라미터 (`mixup_alpha`, `mixup_layers`) — trainer가 읽음

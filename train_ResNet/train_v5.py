@@ -1,17 +1,24 @@
 """
-train/train_v6.py
+train/train_v5.py
 
-Entry point for V6: V1 × V2 (LSE + Aug) × Manifold Mixup × 3 losses.
+Entry point for V5: V1 soft routing × Manifold Mixup (V3) × 1 loss (cb_bce_with_logits_loss).
+
+No LSE / V2 augmentation. V1 CLAHE applied to both train and val.
+WeightedRandomSampler (V3 pattern) used instead of LSE.
+Model: ResNet50ManifoldMixup (build_model("resnet50")).
+Optimizer: AdamW (V5 default, same as V3).
+
+Outer loop: 4 CLAHE variants (V1_L, V1_LA, V1_LB, V1_LAB)
+Inner loop: 1 loss function (cb_bce_with_logits_loss)
+Total: 4 training runs.
 
 Usage:
-    python -m train.train_v6 --config configs/v6.yaml
-    python -m train.train_v6 --config configs/v6.yaml --smoke
+    python -m train_ResNet.train_v5 --config configs_ResNet/v5.yaml
+    python -m train_ResNet.train_v5 --config configs_ResNet/v5.yaml --smoke
 
 변경 이력:
-  - split JSON: patient_split_7class_stratified.json (8:2)
-              → patient_split_7class_stratified_811.json (8:1:1)
   - test split 로드 + test_loader 구성
-  - 각 variant/loss 학습 후 test 평가 추가 (val threshold 재사용)s
+  - 각 variant/loss 학습 후 test 평가 추가 (val threshold 재사용)
   - soft routing test 평가 추가
   - JSON을 val/test 분리 구조로 저장
 """
@@ -30,15 +37,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 import torchvision.transforms as T
 import yaml
-
-from preprocessing.common import crop_black_border
 
 warnings.filterwarnings("ignore")
 
 CLASS_NAMES = ["N", "D", "G", "C", "A", "H", "M"]
+
 _IMAGENET_MEAN = [0.485, 0.456, 0.406]
 _IMAGENET_STD  = [0.229, 0.224, 0.225]
 
@@ -76,161 +82,89 @@ def _to_serializable(obj):
 
 
 # ---------------------------------------------------------------------------
-# Datasets
+# Dataset
 # ---------------------------------------------------------------------------
 
-class V1ClaheCache:
-    """Variant-scoped cache for (crop_black_border → V1 CLAHE → Resize) result.
-
-    Eliminates redundant V1 CLAHE computation across the 3 loss runs (and
-    all epochs) within a single variant. Keyed by filename, so LSE-expanded
-    records sharing a source image hit the same cache entry.
-    """
-    def __init__(self, image_dir, v1_preprocessor, img_size):
-        self.image_dir = image_dir
-        self.v1 = v1_preprocessor
-        self.img_size = img_size
-        self.store: Dict[str, np.ndarray] = {}
-
-    def get(self, filename: str, label) -> np.ndarray:
-        cached = self.store.get(filename)
-        if cached is not None:
-            return cached
-        img_path = os.path.join(self.image_dir, filename)
-        img_np = np.array(Image.open(img_path).convert("RGB"), dtype=np.uint8)
-        img_np = crop_black_border(img_np)
-        img_np, _ = self.v1.apply(img_np, label)
-        img_np = np.array(Image.fromarray(img_np).resize(
-            (self.img_size, self.img_size), Image.BILINEAR
-        ))
-        self.store[filename] = img_np
-        return img_np
-
-    def clear(self) -> None:
-        self.store.clear()
-
-
-class ODIRV6TrainDataset(Dataset):
-    """Train dataset: cache(crop+V1+Resize) → V2 aug → ToTensor+Normalize.
-
-    V1 CLAHE is pulled from cache when available; V2 augmentation is still
-    re-rolled stochastically each access.
-    """
-    def __init__(self, records, image_dir, img_size=224, cache=None,
-                 v2_preprocessor=None, smoke_n=0):
+class ODIRV5Dataset(Dataset):
+    def __init__(self, df, image_dir, class_cols, img_size=224, preprocessor=None, smoke_n=0):
         if smoke_n > 0:
-            records = records[:smoke_n]
-        self.cache = cache
-        self.v2 = v2_preprocessor
-        self.image_dir = image_dir
-        self.img_size = img_size
+            df = df.head(smoke_n)
+        self.preprocessor = preprocessor
+        self._resize = T.Resize((img_size, img_size))
         self._to_tensor_norm = T.Compose([
-            T.ToTensor(), T.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
+            T.ToTensor(),
+            T.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
         ])
         self.samples = []
         missing = 0
-        for rec in records:
-            fname = rec["filename"]
-            img_path = os.path.join(image_dir, fname)
+        for _, row in df.iterrows():
+            img_path = os.path.join(image_dir, str(row["filename"]))
             if not os.path.isfile(img_path):
                 missing += 1
                 continue
-            self.samples.append((fname, rec["labels"].copy()))
+            label = row[class_cols].values.astype(np.float32)
+            self.samples.append((img_path, label))
         if missing:
-            print(f"  [warn] {missing} records skipped", file=sys.stderr)
+            print(f"  [warn] {missing} rows skipped", file=sys.stderr)
 
-    def __len__(self): return len(self.samples)
+    def __len__(self):
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        fname, label = self.samples[idx]
-        img_np = self.cache.get(fname, label)
-        if self.v2 is not None:
-            # V2's Resize is a no-op since cache is already (img_size, img_size).
-            img_np, _ = self.v2.apply(img_np, label)
-        return self._to_tensor_norm(img_np), torch.tensor(label, dtype=torch.float32)
-
-
-class ODIRV6EvalDataset(Dataset):
-    """Val/Test dataset: cache(crop+V1+Resize) → ToTensor+Normalize.
-
-    No V2 augmentation. Shares the V1 CLAHE cache with the train dataset.
-    """
-    def __init__(self, records, image_dir, img_size=224, cache=None, smoke_n=0):
-        if smoke_n > 0:
-            records = records[:smoke_n]
-        self.cache = cache
-        self.image_dir = image_dir
-        self.img_size = img_size
-        self._to_tensor_norm = T.Compose([
-            T.ToTensor(), T.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
-        ])
-        self.samples = []
-        missing = 0
-        for rec in records:
-            fname = rec["filename"]
-            img_path = os.path.join(image_dir, fname)
-            if not os.path.isfile(img_path):
-                missing += 1
-                continue
-            self.samples.append((fname, rec["labels"].copy()))
-        if missing:
-            print(f"  [warn] {missing} records skipped", file=sys.stderr)
-
-    def __len__(self): return len(self.samples)
-
-    def __getitem__(self, idx):
-        fname, label = self.samples[idx]
-        img_np = self.cache.get(fname, label)
-        return self._to_tensor_norm(img_np), torch.tensor(label, dtype=torch.float32)
+        img_path, label = self.samples[idx]
+        img_pil = self._resize(Image.open(img_path).convert("RGB"))
+        if self.preprocessor is not None:
+            img_np = np.array(img_pil, dtype=np.uint8)
+            img_np, _ = self.preprocessor.apply(img_np, label)
+            img_tensor = self._to_tensor_norm(img_np)
+        else:
+            img_tensor = self._to_tensor_norm(img_pil)
+        return img_tensor, torch.tensor(label, dtype=torch.float32)
 
 
 # ---------------------------------------------------------------------------
-# Training loop — Manifold Mixup with mixup_prob
+# DataLoader helper
 # ---------------------------------------------------------------------------
 
-def train_one_epoch(model, loader, optimizer, criterion, device, alpha, mixup_layers,
-                    scaler=None, mixup_prob=1.0, grad_clip=0.0):
+def make_weighted_sampler(dataset: ODIRV5Dataset) -> WeightedRandomSampler:
+    labels = np.stack([s[1] for s in dataset.samples])
+    class_freq = labels.sum(axis=0).clip(min=1.0)
+    class_inv  = 1.0 / class_freq
+    sample_weights = torch.tensor(
+        (labels * class_inv).sum(axis=1), dtype=torch.float32
+    )
+    return WeightedRandomSampler(
+        sample_weights, num_samples=len(sample_weights), replacement=True
+    )
+
+
+# ---------------------------------------------------------------------------
+# Training loop — Manifold Mixup
+# ---------------------------------------------------------------------------
+
+def train_one_epoch(model, loader, optimizer, criterion, device, alpha, mixup_layers, scaler=None):
     model.train()
     total_loss = 0.0
     use_amp = scaler is not None
-
     for imgs, labels in loader:
         imgs   = imgs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         optimizer.zero_grad()
-
-        do_mixup = (alpha > 0.0) and (np.random.rand() < mixup_prob)
-
         if use_amp:
             with torch.amp.autocast(device_type="cuda"):
-                if do_mixup:
-                    logits, label_a, label_b, lam = model(imgs, y=labels, alpha=alpha, mixup_layers=mixup_layers)
-                    lam = max(lam, 1.0 - lam)
-                    loss = lam * criterion(logits, label_a) + (1.0 - lam) * criterion(logits, label_b)
-                else:
-                    logits = model(imgs)
-                    loss = criterion(logits, labels)
+                out = model(imgs, y=labels, alpha=alpha, mixup_layers=mixup_layers)
+                logits, label_a, label_b, lam = out
+                loss = lam * criterion(logits, label_a) + (1.0 - lam) * criterion(logits, label_b)
             scaler.scale(loss).backward()
-            if grad_clip > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
         else:
-            if do_mixup:
-                logits, label_a, label_b, lam = model(imgs, y=labels, alpha=alpha, mixup_layers=mixup_layers)
-                lam = max(lam, 1.0 - lam)
-                loss = lam * criterion(logits, label_a) + (1.0 - lam) * criterion(logits, label_b)
-            else:
-                logits = model(imgs)
-                loss = criterion(logits, labels)
+            out = model(imgs, y=labels, alpha=alpha, mixup_layers=mixup_layers)
+            logits, label_a, label_b, lam = out
+            loss = lam * criterion(logits, label_a) + (1.0 - lam) * criterion(logits, label_b)
             loss.backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
-
         total_loss += loss.item()
-
     return total_loss / max(len(loader), 1)
 
 
@@ -243,9 +177,8 @@ def train(cfg: dict, smoke: bool = False) -> None:
     from model.base import build_model
     from preprocessing.v1.clahe import V1Preprocessor
     from preprocessing.v1.routing import DEFAULT_VARIANTS, soft_route_uniform
-    from preprocessing.v2.augmentation import V2Preprocessor
-    from preprocessing.v2.oversampling import expand_with_lse
     from preprocessing.v2.losses import effective_number_class_weights, make_criterion
+    from preprocessing.v5.preprocess import V5Preprocessor
     from analysis.metrics import compute_metrics, evaluate_with_tta, find_optimal_thresholds
 
     # ── Seed + device ────────────────────────────────────────────────────
@@ -289,51 +222,29 @@ def train(cfg: dict, smoke: bool = False) -> None:
     print(f"Train: {len(train_df)} / Val: {len(val_df)}"
           + (f" / Test: {len(test_df)}" if test_df is not None else ""))
 
-    # ── CB weights (pre-LSE) ─────────────────────────────────────────────
+    # ── CB weights ───────────────────────────────────────────────────────
     labels_ref_np = train_df[class_cols].values.astype(np.float32)
     cb_beta       = float(cfg.get("losses", {}).get("cb_beta", 0.9999))
     cb_normalize  = cfg.get("losses", {}).get("cb_weight_normalize", "mean_one")
-    cb_weights    = effective_number_class_weights(labels_ref_np, beta=cb_beta, normalize=cb_normalize)
-    print(f"[CB weights from original train_df ({len(train_df)} rows)]")
-    for i, c in enumerate(class_cols):
-        print(f"  {c}: {cb_weights[i]:.4f}")
-
-    # ── LSE expansion ────────────────────────────────────────────────────
-    pre_cfg      = cfg.get("preprocessing", {})
-    target_count = int(pre_cfg.get("lse_custom_target_count", 850))
-    max_aug      = int(pre_cfg.get("lse_max_aug_per_source", 12))
-
-    expanded_records = expand_with_lse(
-        train_df, class_cols=class_cols,
-        target_count=target_count, max_aug_per_source=max_aug, seed=seed,
+    cb_mode       = cfg.get("losses", {}).get("cb_weight_mode", "effective_number")
+    cb_weights    = effective_number_class_weights(
+        labels_ref_np, beta=cb_beta, normalize=cb_normalize, mode=cb_mode,
     )
+    print(f"[CB weights, mode={cb_mode}]")
+    for i, c in enumerate(class_cols):
+        print(f"  {c}: w={cb_weights[i]:.4f}")
 
-    def _df_to_records(df):
-        return [{"filename": str(row["filename"]),
-                 "labels": row[class_cols].values.astype(np.float32),
-                 "aug_idx": 0}
-                for _, row in df.iterrows()]
-
-    val_records  = _df_to_records(val_df)
-    test_records = _df_to_records(test_df) if test_df is not None else None
-
+    # ── Config ───────────────────────────────────────────────────────────
     smoke_train = 200 if smoke else 0
     smoke_val   = 50  if smoke else 0
     smoke_test  = 50  if smoke else 0
 
-    # ── Config ───────────────────────────────────────────────────────────
+    pre_cfg      = cfg.get("preprocessing", {})
     variants     = pre_cfg.get("variants", DEFAULT_VARIANTS)
     clip_limit   = float(pre_cfg.get("clip_limit", 2.0))
     tile_grid    = tuple(pre_cfg.get("tile_grid_size", [8, 8]))
     alpha        = float(pre_cfg.get("mixup_alpha", 0.2))
-    mixup_layers = list(pre_cfg.get("mixup_layers", [0, 1, 2, 3]))
-    mixup_prob   = float(pre_cfg.get("mixup_prob", 1.0))
-
-    aug_kwargs = {k: pre_cfg[k] for k in (
-        "hflip_p", "vflip_p", "geo_p", "rotate_limit", "affine_scale",
-        "affine_translate", "affine_rotate", "affine_shear", "crop_scale",
-        "color_jitter_p", "brightness", "contrast", "saturation", "blur_p", "blur_limit",
-    ) if k in pre_cfg}
+    mixup_layers = list(pre_cfg.get("mixup_layers", [1, 2, 3]))
 
     train_cfg    = cfg["train"]
     batch_size   = int(train_cfg.get("batch_size", 32))
@@ -343,15 +254,12 @@ def train(cfg: dict, smoke: bool = False) -> None:
     weight_decay = float(train_cfg.get("weight_decay", 1e-4))
     dropout      = float(train_cfg.get("dropout", 0.5))
     num_workers  = 0 if smoke else int(train_cfg.get("num_workers", 4))
-    grad_clip    = float(train_cfg.get("grad_clip", 0.0))
-    eta_min      = float(train_cfg.get("eta_min", 0.0))
 
-    loss_experiments = cfg.get("losses", {}).get("experiments",
-        ["robust_asymmetric_loss", "cb_bce_with_logits_loss", "cb_focal_loss"])
-    loss_params = {k: cfg.get("losses", {}).get(k) for k in cfg.get("losses", {})}
+    loss_experiments = cfg.get("losses", {}).get("experiments", ["cb_bce_with_logits_loss"])
+    loss_params      = {k: cfg.get("losses", {}).get(k) for k in cfg.get("losses", {})}
 
-    output_base = cfg.get("output_dir", "analysis/v6_analysis")
-    exp_name    = cfg.get("experiment_name", "v6_resnet50_seed42")
+    output_base = cfg.get("output_dir", "analysis/v5_analysis")
+    exp_name    = cfg.get("experiment_name", "v5_resnet50_seed42")
     os.makedirs(output_base, exist_ok=True)
 
     log_thresholds = np.full(num_classes, 0.5, dtype=np.float32)
@@ -372,45 +280,28 @@ def train(cfg: dict, smoke: bool = False) -> None:
         per_variant_per_loss_val[variant]  = {}
         per_variant_per_loss_test[variant] = {}
 
-        v1_pre = V1Preprocessor(variant=variant, clip_limit=clip_limit, tile_grid_size=tile_grid)
-        v2_pre = V2Preprocessor(img_size=img_size, **aug_kwargs)
-        # Shared V1 CLAHE cache for this variant: reused across train/val/test
-        # datasets and across all 3 loss runs × num_epochs.
-        clahe_cache = V1ClaheCache(image_dir, v1_pre, img_size)
-
-        train_ds = ODIRV6TrainDataset(expanded_records, image_dir, img_size,
-                                      cache=clahe_cache, v2_preprocessor=v2_pre,
-                                      smoke_n=smoke_train)
-        val_ds   = ODIRV6EvalDataset(val_records, image_dir, img_size,
-                                     cache=clahe_cache, smoke_n=smoke_val)
-        test_ds  = (
-            ODIRV6EvalDataset(test_records, image_dir, img_size,
-                              cache=clahe_cache, smoke_n=smoke_test)
-            if test_records is not None else None
+        v5_pre = V5Preprocessor(
+            v1_kwargs=dict(variant=variant, clip_limit=clip_limit, tile_grid_size=tile_grid)
         )
 
-        print(f"  Train (expanded): {len(train_ds)}  Val: {len(val_ds)}"
+        train_ds = ODIRV5Dataset(train_df, image_dir, class_cols, img_size, v5_pre, smoke_train)
+        val_ds   = ODIRV5Dataset(val_df,   image_dir, class_cols, img_size, v5_pre, smoke_val)
+        test_ds  = (
+            ODIRV5Dataset(test_df, image_dir, class_cols, img_size, v5_pre, smoke_test)
+            if test_df is not None else None
+        )
+
+        print(f"  Train: {len(train_ds)}  Val: {len(val_ds)}"
               + (f"  Test: {len(test_ds)}" if test_ds else ""))
 
-        # persistent_workers keeps worker processes alive across epoch
-        # boundaries so each worker's V1 CLAHE cache survives between
-        # epochs AND between the 3 loss runs (loaders are variant-scoped).
-        # With num_workers=0 the cache lives in the main process and is
-        # trivially shared.
-        loader_persist = num_workers > 0
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                                  num_workers=num_workers,
-                                  persistent_workers=loader_persist,
-                                  pin_memory=(device.type == "cuda"))
+        sampler = make_weighted_sampler(train_ds)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler,
+                                  num_workers=num_workers, pin_memory=(device.type == "cuda"))
         val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                                  num_workers=num_workers,
-                                  persistent_workers=loader_persist,
-                                  pin_memory=(device.type == "cuda"))
+                                  num_workers=num_workers, pin_memory=(device.type == "cuda"))
         test_loader  = (
             DataLoader(test_ds, batch_size=batch_size, shuffle=False,
-                       num_workers=num_workers,
-                       persistent_workers=loader_persist,
-                       pin_memory=(device.type == "cuda"))
+                       num_workers=num_workers, pin_memory=(device.type == "cuda"))
             if test_ds is not None else None
         )
 
@@ -428,8 +319,8 @@ def train(cfg: dict, smoke: bool = False) -> None:
             ).to(device)
 
             criterion = make_criterion(loss_name, cb_weights=cb_weights, params=loss_params).to(device)
-            optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=eta_min)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
             scaler    = torch.amp.GradScaler("cuda") if use_amp else None
 
             history_path   = os.path.join(loss_dir, "history.csv")
@@ -437,15 +328,15 @@ def train(cfg: dict, smoke: bool = False) -> None:
             with open(history_path, "w", newline="") as hf:
                 csv.DictWriter(hf, fieldnames=history_fields).writeheader()
 
-            best_f1    = -1.0
+            best_auc   = -1.0
             no_improve = 0
             best_epoch = 0
             ckpt_path  = os.path.join(loss_dir, "best.pth")
 
             for epoch in range(1, num_epochs + 1):
                 train_loss = train_one_epoch(
-                    model, train_loader, optimizer, criterion, device,
-                    alpha, mixup_layers, scaler, mixup_prob, grad_clip,
+                    model, train_loader, optimizer, criterion,
+                    device, alpha, mixup_layers, scaler
                 )
 
                 model.eval()
@@ -465,17 +356,18 @@ def train(cfg: dict, smoke: bool = False) -> None:
                     torch.tensor(val_labels, dtype=torch.float32),
                 ).item())
 
-                epoch_metrics = compute_metrics(val_labels, val_probs, log_thresholds, class_names)
-                val_auc   = epoch_metrics["macro_auc"]
-                val_f1    = epoch_metrics["macro_f1"]
-                val_kappa = epoch_metrics["kappa"]
-                val_sens  = float(np.mean(list(epoch_metrics["sensitivity"].values())))
-                val_spec  = float(np.mean(list(epoch_metrics["specificity"].values())))
+                epoch_metrics  = compute_metrics(val_labels, val_probs, log_thresholds, class_names)
+                val_auc        = epoch_metrics["macro_auc"]
+                val_f1         = epoch_metrics["macro_f1"]
+                val_kappa      = epoch_metrics["kappa"]
+                sens_per_class = epoch_metrics["sensitivity"]
+                val_sens       = float(np.mean(list(sens_per_class.values())))
                 scheduler.step()
 
+                sens_str = " ".join(f"{c}={sens_per_class.get(c, float('nan')):.3f}" for c in class_names)
                 print(f"    Epoch {epoch:03d}/{num_epochs} | loss={train_loss:.4f} | "
                       f"val_loss={val_loss:.4f} | val_f1={val_f1:.4f} | "
-                      f"val_kappa={val_kappa:.4f} | val_sens={val_sens:.4f} | val_spec={val_spec:.4f}")
+                      f"val_sens_macro={val_sens:.4f} | sens[{sens_str}]")
 
                 with open(history_path, "a", newline="") as hf:
                     writer = csv.DictWriter(hf, fieldnames=history_fields)
@@ -485,12 +377,12 @@ def train(cfg: dict, smoke: bool = False) -> None:
                         "val_macro_f1": round(val_f1, 6), "val_kappa": round(val_kappa, 6),
                     })
 
-                if not np.isnan(val_f1) and val_f1 > best_f1:
-                    best_f1 = val_f1
+                if not np.isnan(val_auc) and val_auc > best_auc:
+                    best_auc = val_auc
                     best_epoch = epoch
                     no_improve = 0
                     torch.save(model.state_dict(), ckpt_path)
-                    print(f"      [saved] best.pth (val_f1={best_f1:.4f})")
+                    print(f"      [saved] best.pth (val_auc={best_auc:.4f})")
                 else:
                     no_improve += 1
                     if no_improve >= patience:
@@ -498,7 +390,7 @@ def train(cfg: dict, smoke: bool = False) -> None:
                         break
 
             # ── Post-training: val 평가 + threshold 최적화 ──────────────
-            if best_f1 >= 0 and os.path.isfile(ckpt_path):
+            if best_auc >= 0 and os.path.isfile(ckpt_path):
                 print(f"\n    [reload] Loading best.pth (epoch {best_epoch}) ...")
                 model.load_state_dict(torch.load(ckpt_path, map_location=device))
 
@@ -558,14 +450,6 @@ def train(cfg: dict, smoke: bool = False) -> None:
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-        # ── End of variant: free V1 CLAHE cache + tear down loaders ─────
-        print(f"  [cache] V1 CLAHE cache hit {len(clahe_cache.store)} unique images "
-              f"for variant {variant}; clearing.")
-        clahe_cache.clear()
-        del train_loader, val_loader
-        if test_loader is not None:
-            del test_loader
-
     # ── Routing aggregation ──────────────────────────────────────────────
     print(f"\n{'='*60}")
     print("Computing soft routing metrics per loss...")
@@ -618,7 +502,7 @@ def train(cfg: dict, smoke: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train V6: V1 × V2 × Manifold Mixup × 3 losses")
+    parser = argparse.ArgumentParser(description="Train V5: V1 × Manifold Mixup × cb_bce_with_logits_loss")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
     parser.add_argument("--smoke", action="store_true",
                         help="Quick smoke test: 200 train / 50 val, 2 epochs per run")
